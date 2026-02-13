@@ -1,0 +1,9 @@
+node_modules
+dist
+.git
+.env.local
+*.local
+.DS_Store
+thoughts
+tickets
+CLAUDE.md
