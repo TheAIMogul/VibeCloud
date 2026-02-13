@@ -1,0 +1,834 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { createRoot } from 'react-dom/client';
+import {
+  Settings,
+  Send,
+  Download,
+  Loader2,
+  RefreshCcw,
+  ShieldCheck,
+  Save,
+  Undo,
+  ShieldAlert,
+  Activity,
+  Music2,
+  Headphones,
+  Zap,
+  Play,
+  Pause,
+  Repeat,
+  SkipForward,
+  SkipBack,
+  ListMusic,
+  ChevronDown,
+  ChevronUp,
+  ExternalLink,
+} from 'lucide-react';
+import { GoogleGenAI } from "@google/genai";
+// @ts-ignore
+import ID3Writer from 'https://esm.sh/browser-id3-writer@4.4.0';
+
+// --- Constants ---
+const KNOWN_GOOD_CLIENT_ID = 'kJ5grOxsTDFFctYx2ZQdQ7viN7EmoTKn';
+const TARGET_USER_ID = '5402929';
+const DEFAULT_PB_ACCESS_TOKEN = 'REDACTED_PUSHBULLET_TOKEN';
+const SC_API_BASE = 'https://api-v2.soundcloud.com';
+const PLACEHOLDER_IMG = 'https://placehold.co/400x400/13172A/787E91?text=%E2%99%AA';
+const LIKES_PER_PAGE = 24;
+
+// --- Networking Layer ---
+const PROXY_GATES = [
+  { name: 'CORSProxy.io', fn: (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}` },
+  { name: 'AllOrigins', fn: (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` }
+];
+
+// --- Types ---
+interface Secrets { pbAccessToken: string; }
+interface LogEntry {
+  id: string;
+  message: string;
+  type: 'info' | 'success' | 'error' | 'process' | 'warning' | 'network';
+  timestamp: string;
+}
+interface SCTrack {
+  id: number;
+  title: string;
+  permalink_url: string;
+  artwork_url: string;
+  user: { username: string; };
+}
+interface PlayerState {
+  track: SCTrack | null;
+  blobUrl: string | null;
+  taggedBlob: Blob | null;
+  fileName: string;
+}
+
+const App: React.FC = () => {
+  const [url, setUrl] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isFetchingLikes, setIsFetchingLikes] = useState(false);
+  const [showConfig, setShowConfig] = useState(false);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [likes, setLikes] = useState<SCTrack[]>([]);
+  const [hasCloudKey, setHasCloudKey] = useState(false);
+  const [activeTrackId, setActiveTrackId] = useState<number | null>(null);
+  const [feedLabel, setFeedLabel] = useState('Liked Tracks');
+  const [consoleOpen, setConsoleOpen] = useState(false);
+
+  // Infinite scroll
+  const [nextHref, setNextHref] = useState<string | null>(null);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const feedScrollRef = useRef<HTMLDivElement>(null);
+
+  // Audio player state
+  const [player, setPlayer] = useState<PlayerState>({ track: null, blobUrl: null, taggedBlob: null, fileName: '' });
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [isRepeat, setIsRepeat] = useState(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  const [secrets, setSecrets] = useState<Secrets>(() => {
+    const savedPb = localStorage.getItem('pb_access_token');
+    return { pbAccessToken: savedPb !== null ? savedPb : DEFAULT_PB_ACCESS_TOKEN };
+  });
+  const [tempSecrets, setTempSecrets] = useState<Secrets>(secrets);
+  const logEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setTempSecrets(secrets);
+    localStorage.setItem('pb_access_token', secrets.pbAccessToken);
+  }, [secrets]);
+
+  useEffect(() => { checkKeyStatus(); fetchLikes(); }, []);
+
+  // Audio player effects — auto-advance to next song
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const onTime = () => setCurrentTime(audio.currentTime);
+    const onDur = () => setDuration(audio.duration);
+    const onEnd = () => {
+      if (isRepeat) {
+        audio.currentTime = 0;
+        audio.play();
+      } else {
+        // Auto-advance to next track
+        playNextTrack();
+      }
+    };
+    audio.addEventListener('timeupdate', onTime);
+    audio.addEventListener('loadedmetadata', onDur);
+    audio.addEventListener('ended', onEnd);
+    return () => {
+      audio.removeEventListener('timeupdate', onTime);
+      audio.removeEventListener('loadedmetadata', onDur);
+      audio.removeEventListener('ended', onEnd);
+    };
+  }, [isRepeat, likes, player.track]);
+
+  // Auto-play when blobUrl changes
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio || !player.blobUrl) return;
+    audio.load();
+    audio.play().then(() => setIsPlaying(true)).catch(() => {});
+  }, [player.blobUrl]);
+
+  // Infinite scroll — preload at 70%
+  useEffect(() => {
+    const el = feedScrollRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      const scrollPercent = (el.scrollTop + el.clientHeight) / el.scrollHeight;
+      if (scrollPercent >= 0.7 && nextHref && !isLoadingMore && !isFetchingLikes) {
+        loadMore();
+      }
+    };
+    el.addEventListener('scroll', onScroll);
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [nextHref, isLoadingMore, isFetchingLikes]);
+
+  const checkKeyStatus = async () => {
+    // @ts-ignore
+    if (window.aistudio && typeof window.aistudio.hasSelectedApiKey === 'function') {
+      // @ts-ignore
+      const hasKey = await window.aistudio.hasSelectedApiKey();
+      setHasCloudKey(hasKey);
+    }
+  };
+
+  const handleConnectCloud = async () => {
+    // @ts-ignore
+    if (window.aistudio && typeof window.aistudio.openSelectKey === 'function') {
+      // @ts-ignore
+      await window.aistudio.openSelectKey();
+      setHasCloudKey(true);
+    }
+  };
+
+  const handleSaveConfig = () => { setSecrets(tempSecrets); addLog("Config saved", "success"); };
+  const handleReset = () => { setSecrets({ pbAccessToken: DEFAULT_PB_ACCESS_TOKEN }); addLog("Config reset", "info"); };
+
+  const addLog = (message: string, type: LogEntry['type'] = 'info') => {
+    setLogs(prev => [...prev, {
+      id: Math.random().toString(36).substr(2, 9),
+      message,
+      type,
+      timestamp: new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    }]);
+  };
+
+  const robustFetch = async (targetUrl: string): Promise<Response> => {
+    for (let i = 0; i < PROXY_GATES.length; i++) {
+      const proxyUrl = PROXY_GATES[i].fn(targetUrl);
+      addLog(`Gate ${i + 1}...`, 'network');
+      try {
+        const res = await fetch(proxyUrl);
+        if (res.ok) { addLog(`Gate ${i + 1}: OK`, 'network'); return res; }
+        addLog(`Gate ${i + 1}: ${res.status}`, 'warning');
+      } catch (e: any) {
+        addLog(`Gate ${i + 1}: ${e.message}`, 'warning');
+      }
+    }
+    throw new Error("All Proxy Gates Failed");
+  };
+
+  useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
+
+  const fetchLikes = async () => {
+    setIsFetchingLikes(true);
+    addLog("Syncing feed...", "network");
+    try {
+      const likesUrl = `${SC_API_BASE}/users/${TARGET_USER_ID}/track_likes?client_id=${KNOWN_GOOD_CLIENT_ID}&limit=${LIKES_PER_PAGE}&offset=0&linked_partitioning=1&app_version=1770807155&app_locale=en`;
+      const likesRes = await robustFetch(likesUrl);
+      const likesData = await likesRes.json();
+      const tracks = likesData.collection.map((item: any) => item.track).filter(Boolean);
+      setLikes(tracks);
+      setNextHref(likesData.next_href || null);
+      setFeedLabel('Liked Tracks');
+      addLog(`${tracks.length} tracks synced`, "success");
+    } catch (error: any) {
+      addLog(`Feed sync: ${error.message}`, "warning");
+    } finally {
+      setIsFetchingLikes(false);
+    }
+  };
+
+  // Infinite scroll — load more
+  const loadMore = async () => {
+    if (!nextHref || isLoadingMore) return;
+    setIsLoadingMore(true);
+    try {
+      const res = await robustFetch(`${nextHref}&client_id=${KNOWN_GOOD_CLIENT_ID}`);
+      const data = await res.json();
+      const newTracks = (data.collection || []).map((item: any) => item.track || item).filter(Boolean);
+      setLikes(prev => [...prev, ...newTracks]);
+      setNextHref(data.next_href || null);
+      addLog(`+${newTracks.length} tracks loaded`, "info");
+    } catch (e: any) {
+      addLog(`Load more: ${e.message}`, "warning");
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
+
+  // --- Playlist Support ---
+  const resolvePlaylist = async (playlistUrl: string) => {
+    setIsFetchingLikes(true);
+    setLogs([]);
+    addLog("Resolving playlist...", "network");
+    try {
+      const resolveUrl = `${SC_API_BASE}/resolve?url=${encodeURIComponent(playlistUrl)}&client_id=${KNOWN_GOOD_CLIENT_ID}`;
+      const res = await robustFetch(resolveUrl);
+      if (!res.ok) throw new Error(`Resolve failed (${res.status})`);
+      const data = await res.json();
+
+      if (data.kind === 'playlist' || data.tracks) {
+        const tracks: SCTrack[] = (data.tracks || []).filter((t: any) => t && t.title);
+        setLikes(tracks);
+        setNextHref(null);
+        setFeedLabel(data.title || 'Playlist');
+        setUrl('');
+        addLog(`Playlist "${data.title}" loaded: ${tracks.length} tracks`, "success");
+      } else if (data.kind === 'track') {
+        await playTrackInline(data);
+      } else {
+        addLog("Unrecognized URL type", "warning");
+      }
+    } catch (error: any) {
+      addLog(`Playlist resolve: ${error.message}`, "error");
+    } finally {
+      setIsFetchingLikes(false);
+    }
+  };
+
+  // --- Direct SoundCloud Stream Engine ---
+  const resolveTrackData = async (trackUrl: string): Promise<any> => {
+    const resolveUrl = `${SC_API_BASE}/resolve?url=${encodeURIComponent(trackUrl)}&client_id=${KNOWN_GOOD_CLIENT_ID}`;
+    addLog(`Resolving...`, "network");
+    const res = await robustFetch(resolveUrl);
+    if (!res.ok) throw new Error(`Resolve failed (${res.status})`);
+    return res.json();
+  };
+
+  const getProgressiveStreamUrl = async (trackData: any): Promise<string> => {
+    const transcodings = trackData?.media?.transcodings || [];
+    const progressive = transcodings.find((t: any) => t.format?.protocol === 'progressive' && t.format?.mime_type?.includes('audio/mpeg'));
+    const hlsMp3 = transcodings.find((t: any) => t.format?.protocol === 'hls' && t.format?.mime_type?.includes('audio/mpeg'));
+    const anyProg = transcodings.find((t: any) => t.format?.protocol === 'progressive');
+    const transcoding = progressive || hlsMp3 || anyProg;
+    if (!transcoding) throw new Error("No downloadable stream");
+    const streamApiUrl = `${transcoding.url}?client_id=${KNOWN_GOOD_CLIENT_ID}`;
+    addLog(`Stream (${transcoding.preset})`, "network");
+    const streamRes = await robustFetch(streamApiUrl);
+    if (!streamRes.ok) throw new Error(`Stream failed (${streamRes.status})`);
+    const streamData = await streamRes.json();
+    if (!streamData.url) throw new Error("No stream URL");
+    return streamData.url;
+  };
+
+  // Play a track inline (tap title/artwork → stream to player)
+  const playTrackInline = async (track: Partial<SCTrack> | any) => {
+    if (isProcessing) return;
+    setIsProcessing(true);
+    setLogs([]);
+    if (track.id) setActiveTrackId(track.id);
+    addLog(`Loading...`, "info");
+
+    try {
+      const targetUrl = track.permalink_url;
+      if (!targetUrl) throw new Error("Invalid URL");
+
+      let fullTrackData: any = track;
+      // If we don't have transcodings, resolve fully
+      if (!track?.media?.transcodings) {
+        try {
+          fullTrackData = await resolveTrackData(targetUrl);
+          addLog(`"${fullTrackData.title}" - ${fullTrackData.user?.username}`, "success");
+        } catch (e: any) {
+          addLog(`Resolve: ${e.message}`, "warning");
+          throw new Error("Cannot resolve track");
+        }
+      }
+
+      const streamUrl = await getProgressiveStreamUrl(fullTrackData);
+      addLog("Stream acquired", "success");
+
+      addLog("Buffering...", "process");
+      const fileRes = await fetch(streamUrl);
+      if (!fileRes.ok) throw new Error(`Download failed (${fileRes.status})`);
+      const audioBuffer = await fileRes.arrayBuffer();
+      addLog(`${(audioBuffer.byteLength / 1024 / 1024).toFixed(1)} MB`, "info");
+
+      const trackTitle = fullTrackData?.title || track?.title || "Extracted Audio";
+      const artistName = fullTrackData?.user?.username || track?.user?.username || "SoundCloud User";
+      const artUrl = fullTrackData?.artwork_url || track?.artwork_url;
+      let artworkBuffer: ArrayBuffer | null = null;
+
+      if (artUrl) {
+        try {
+          const artRes = await fetch(artUrl.replace('-large', '-t500x500'));
+          if (artRes.ok) artworkBuffer = await artRes.arrayBuffer();
+        } catch (e) {}
+      }
+
+      const fileName = `${trackTitle.replace(/[^a-z0-9 ]/gi, '').trim() || 'Track'}.mp3`;
+      addLog("Tagging...", "process");
+      const writer = new ID3Writer(audioBuffer);
+      writer.setFrame('TIT2', trackTitle).setFrame('TPE1', [artistName]);
+      if (artworkBuffer) {
+        writer.setFrame('APIC', { type: 3, data: artworkBuffer, description: 'Cover', useUnicodeEncoding: false });
+      }
+      writer.addTag();
+      const taggedBlob = writer.getBlob();
+
+      // Revoke old blob
+      if (player.blobUrl) window.URL.revokeObjectURL(player.blobUrl);
+
+      const blobUrl = window.URL.createObjectURL(taggedBlob);
+      const playerTrack: SCTrack = {
+        id: fullTrackData?.id || track?.id || Date.now(),
+        title: trackTitle,
+        permalink_url: targetUrl,
+        artwork_url: artUrl || PLACEHOLDER_IMG,
+        user: { username: artistName },
+      };
+      setPlayer({ track: playerTrack, blobUrl, taggedBlob, fileName });
+      addLog(`Now playing`, "success");
+    } catch (error: any) {
+      addLog(`${error.message}`, "error");
+    } finally {
+      setIsProcessing(false);
+      setActiveTrackId(null);
+    }
+  };
+
+  // Auto-advance: play next track in the list
+  const playNextTrack = () => {
+    if (!player.track || likes.length === 0) {
+      setIsPlaying(false);
+      return;
+    }
+    const currentIdx = likes.findIndex(t => t.id === player.track!.id);
+    if (currentIdx === -1 || currentIdx >= likes.length - 1) {
+      // End of list
+      setIsPlaying(false);
+      return;
+    }
+    const nextTrack = likes[currentIdx + 1];
+    playTrackInline(nextTrack);
+  };
+
+  const runExtraction = async (track: Partial<SCTrack> | string, mode: 'push' | 'download') => {
+    if (isProcessing) return;
+    setIsProcessing(true);
+    setLogs([]);
+    if (typeof track !== 'string' && track.id) setActiveTrackId(track.id);
+    addLog(`Starting...`, "info");
+
+    try {
+      const targetUrl = typeof track === 'string' ? track : track.permalink_url;
+      if (!targetUrl) throw new Error("Invalid URL");
+
+      let trackData: any = typeof track === 'string' ? null : track;
+      let fullTrackData: any = null;
+
+      try {
+        fullTrackData = await resolveTrackData(targetUrl);
+        addLog(`"${fullTrackData.title}" - ${fullTrackData.user?.username}`, "success");
+        if (!trackData) trackData = fullTrackData;
+      } catch (e: any) {
+        addLog(`Resolve: ${e.message}`, "warning");
+        if (!trackData) throw new Error("Cannot resolve track");
+      }
+
+      const streamUrl = await getProgressiveStreamUrl(fullTrackData || trackData);
+      addLog("Stream acquired", "success");
+
+      addLog("Downloading...", "process");
+      const fileRes = await fetch(streamUrl);
+      if (!fileRes.ok) throw new Error(`Download failed (${fileRes.status})`);
+      const audioBuffer = await fileRes.arrayBuffer();
+      addLog(`${(audioBuffer.byteLength / 1024 / 1024).toFixed(1)} MB`, "info");
+
+      const trackTitle = fullTrackData?.title || trackData?.title || "Extracted Audio";
+      const artistName = fullTrackData?.user?.username || trackData?.user?.username || "SoundCloud User";
+      const artUrl = fullTrackData?.artwork_url || trackData?.artwork_url;
+      let artworkBuffer: ArrayBuffer | null = null;
+
+      if (artUrl) {
+        try {
+          const artRes = await fetch(artUrl.replace('-large', '-t500x500'));
+          if (artRes.ok) artworkBuffer = await artRes.arrayBuffer();
+        } catch (e) {}
+      }
+
+      const fileName = `${trackTitle.replace(/[^a-z0-9 ]/gi, '').trim() || 'Track'}.mp3`;
+      addLog("Tagging...", "process");
+      const writer = new ID3Writer(audioBuffer);
+      writer.setFrame('TIT2', trackTitle).setFrame('TPE1', [artistName]);
+      if (artworkBuffer) {
+        writer.setFrame('APIC', { type: 3, data: artworkBuffer, description: 'Cover', useUnicodeEncoding: false });
+      }
+      writer.addTag();
+      const taggedBlob = writer.getBlob();
+
+      if (player.blobUrl) window.URL.revokeObjectURL(player.blobUrl);
+      const blobUrl = window.URL.createObjectURL(taggedBlob);
+      const playerTrack: SCTrack = {
+        id: fullTrackData?.id || trackData?.id || Date.now(),
+        title: trackTitle,
+        permalink_url: targetUrl,
+        artwork_url: artUrl || PLACEHOLDER_IMG,
+        user: { username: artistName },
+      };
+      setPlayer({ track: playerTrack, blobUrl, taggedBlob, fileName });
+
+      if (mode === 'download') {
+        const link = document.createElement('a');
+        link.href = blobUrl;
+        link.setAttribute('download', fileName);
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        addLog(`Saved ${fileName}`, "success");
+      } else {
+        // Push mode
+        addLog("Pushing to Pushbullet...", "process");
+        const pbHeaders = { 'Access-Token': secrets.pbAccessToken, 'Content-Type': 'application/json' };
+
+        try {
+          const uploadReq = await fetch('https://api.pushbullet.com/v2/upload-request', {
+            method: 'POST', headers: pbHeaders,
+            body: JSON.stringify({ file_name: fileName, file_type: 'audio/mpeg' })
+          });
+
+          if (uploadReq.status === 401 || uploadReq.status === 403) {
+            throw new Error("Pushbullet token invalid or expired. Go to Settings and enter a valid token from pushbullet.com/#settings/account");
+          }
+          if (!uploadReq.ok) throw new Error(`Pushbullet error (${uploadReq.status})`);
+
+          const uploadSlot = await uploadReq.json();
+          const formData = new FormData();
+          Object.entries(uploadSlot.data).forEach(([key, value]) => formData.append(key, value as string));
+          formData.append('file', taggedBlob, fileName);
+          await fetch(uploadSlot.upload_url, { method: 'POST', body: formData });
+
+          let vibeSummary = `Fresh drop: ${trackTitle}`;
+          try {
+            const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+            const geminiResponse = await ai.models.generateContent({
+              model: 'gemini-3-flash-preview',
+              contents: `Track: "${trackTitle}" by "${artistName}". One sentence vibe check with emojis.`,
+            });
+            vibeSummary = geminiResponse.text || vibeSummary;
+          } catch (e) {}
+
+          await fetch('https://api.pushbullet.com/v2/pushes', {
+            method: 'POST', headers: pbHeaders,
+            body: JSON.stringify({ type: 'file', file_name: fileName, file_type: 'audio/mpeg', file_url: uploadSlot.file_url, body: vibeSummary })
+          });
+          addLog("Pushed!", "success");
+        } catch (pushErr: any) {
+          addLog(pushErr.message, "error");
+          const link = document.createElement('a');
+          link.href = blobUrl;
+          link.setAttribute('download', fileName);
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          addLog(`Saved locally as fallback: ${fileName}`, "warning");
+        }
+      }
+    } catch (error: any) {
+      addLog(`${error.message}`, "error");
+    } finally {
+      setIsProcessing(false);
+      setActiveTrackId(null);
+    }
+  };
+
+  // --- URL handler (playlist vs track) ---
+  const handleUrlSubmit = async () => {
+    if (!url) return;
+    const isPlaylist = url.includes('/sets/');
+    if (isPlaylist) {
+      await resolvePlaylist(url);
+    } else {
+      await runExtraction(url, 'download');
+    }
+  };
+
+  // --- Player controls ---
+  const togglePlay = () => {
+    const audio = audioRef.current;
+    if (!audio || !player.blobUrl) return;
+    if (isPlaying) { audio.pause(); setIsPlaying(false); }
+    else { audio.play(); setIsPlaying(true); }
+  };
+
+  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.currentTime = parseFloat(e.target.value);
+    setCurrentTime(audio.currentTime);
+  };
+
+  const downloadCurrent = () => {
+    if (!player.blobUrl || !player.fileName) return;
+    const link = document.createElement('a');
+    link.href = player.blobUrl;
+    link.setAttribute('download', player.fileName);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  };
+
+  const formatTime = (s: number) => {
+    if (!s || isNaN(s)) return '0:00';
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m}:${sec.toString().padStart(2, '0')}`;
+  };
+
+  const logColor = (type: LogEntry['type']) => {
+    switch(type) {
+      case 'error': return 'text-red-400';
+      case 'success': return 'text-emerald-400';
+      case 'warning': return 'text-amber-400';
+      case 'process': return 'text-peach';
+      case 'network': return 'text-muted';
+      default: return 'text-white/60';
+    }
+  };
+
+  // --- Foldable Console Component (iOS glassmorphism when open) ---
+  const ConsolePanel = ({ compact = false }: { compact?: boolean }) => (
+    <div className="console-glass overflow-hidden" style={{ borderRadius: 16 }}>
+      {/* Toggle header — always visible */}
+      <button
+        onClick={() => setConsoleOpen(!consoleOpen)}
+        className="w-full px-3 py-2 flex items-center justify-between cursor-pointer select-none"
+        style={{ background: 'transparent' }}
+      >
+        <span className={`${compact ? 'text-[8px]' : 'text-[10px]'} font-mono text-muted uppercase tracking-widest flex items-center gap-2`}>
+          <div className={`w-1.5 h-1.5 rounded-full ${isProcessing ? 'bg-peach pulse-dot' : 'bg-muted/30'}`} />
+          engine
+          {logs.length > 0 && <span className="text-muted/50 ml-1">{logs.length}</span>}
+        </span>
+        {consoleOpen
+          ? <ChevronUp className="w-3.5 h-3.5 text-muted/60" />
+          : <ChevronDown className="w-3.5 h-3.5 text-muted/60" />
+        }
+      </button>
+
+      {/* Foldable body */}
+      {consoleOpen && (
+        <div
+          className={`${compact ? 'p-2' : 'p-3'} overflow-y-auto font-mono vibe-scroll border-t border-white/[0.06]`}
+          style={{ maxHeight: compact ? 120 : 400, paddingBottom: compact ? 12 : 20 }}
+        >
+          {logs.length === 0 && <span className="text-muted/30 text-[9px]">Waiting...</span>}
+          {logs.map(log => (
+            <div key={log.id} className={`flex gap-2 ${compact ? 'text-[8px] leading-relaxed' : 'text-[11px] leading-relaxed'}`}>
+              <span className="text-muted/30 shrink-0">{log.timestamp.slice(0,5)}</span>
+              <span className={logColor(log.type)}>
+                {log.message}
+              </span>
+            </div>
+          ))}
+          <div ref={logEndRef} />
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen relative z-10 flex flex-col" style={{ fontFamily: "'Poppins', sans-serif", paddingBottom: player.blobUrl ? 88 : 0 }}>
+      {/* Hidden audio element */}
+      <audio ref={audioRef} src={player.blobUrl || undefined} />
+
+      {/* ========== HEADER ========== */}
+      <header className="px-5 pt-5 pb-3 lg:px-10 lg:pt-7 fade-up">
+        <div className="max-w-6xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-full border border-white/15 flex items-center justify-center bg-white/[0.03]">
+              <Headphones className="w-5 h-5 text-peach" />
+            </div>
+            <div>
+              <h1 className="text-lg font-bold tracking-tight text-white leading-none">VibeDown</h1>
+              <p className="text-[11px] text-muted font-medium tracking-wide mt-0.5">Direct Stream</p>
+            </div>
+          </div>
+          <button onClick={() => setShowConfig(!showConfig)} className={`circle-btn ${showConfig ? 'active' : ''}`}>
+            <Settings className="w-[18px] h-[18px]" />
+          </button>
+        </div>
+      </header>
+
+      {/* ========== CONFIG ========== */}
+      {showConfig && (
+        <div className="px-5 lg:px-10 mb-3 slide-down">
+          <div className="max-w-6xl mx-auto glass-card p-5">
+            <label className="text-[10px] font-semibold text-muted uppercase tracking-widest mb-2 block">Pushbullet Token</label>
+            <input type="password" value={tempSecrets.pbAccessToken}
+              onChange={(e) => setTempSecrets({...tempSecrets, pbAccessToken: e.target.value})}
+              className="vibe-input font-mono text-xs mb-4" style={{ borderRadius: 12 }} />
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex gap-3">
+                <button onClick={handleConnectCloud} className="pill-btn text-muted">
+                  <ShieldCheck className="w-3.5 h-3.5" /> {hasCloudKey ? 'AI Connected' : 'Connect AI'}
+                </button>
+                <button onClick={handleReset} className="pill-btn text-muted"><Undo className="w-3.5 h-3.5" /> Reset</button>
+              </div>
+              <button onClick={handleSaveConfig} className="pill-btn accent"><Save className="w-3.5 h-3.5" /> Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========== MAIN ========== */}
+      <main className="flex-1 px-5 lg:px-10 pb-4">
+        <div className="max-w-6xl mx-auto">
+
+          {/* URL Input */}
+          <div className="mb-4 fade-up fade-up-1">
+            <div className="flex gap-3 items-center">
+              <input type="text" placeholder="Paste SoundCloud track or playlist URL..."
+                value={url} onChange={(e) => setUrl(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleUrlSubmit()}
+                className="vibe-input flex-1" />
+              <button onClick={handleUrlSubmit} disabled={!url || isProcessing}
+                className={`circle-btn ${url ? 'active' : ''}`} style={{ width: 48, height: 48 }}>
+                {isProcessing && !activeTrackId ? <Loader2 className="w-5 h-5 animate-spin text-peach" /> : <Download className="w-5 h-5" />}
+              </button>
+            </div>
+          </div>
+
+          {/* Mobile console — compact, foldable, right under URL */}
+          <div className="lg:hidden mb-4 fade-up fade-up-2">
+            <ConsolePanel compact />
+          </div>
+
+          {/* Desktop: Console LEFT, Feed RIGHT */}
+          <div className="grid grid-cols-1 lg:grid-cols-5 gap-5">
+
+            {/* ===== CONSOLE (Left on desktop, foldable) ===== */}
+            <div className="hidden lg:block lg:col-span-2 fade-up fade-up-2">
+              <div className="flex items-center gap-2 mb-3">
+                <Zap className="w-4 h-4 text-peach" />
+                <h2 className="text-sm font-semibold text-white/90">Console</h2>
+                {isProcessing && <div className="w-1.5 h-1.5 rounded-full bg-peach pulse-dot" />}
+              </div>
+              <ConsolePanel />
+            </div>
+
+            {/* ===== FEED (Right on desktop) ===== */}
+            <div className="lg:col-span-3 fade-up fade-up-3">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <Music2 className="w-4 h-4 text-peach" />
+                  <h2 className="text-sm font-semibold text-white/90">{feedLabel}</h2>
+                  {likes.length > 0 && (
+                    <span className="text-[10px] font-medium text-muted bg-white/5 px-2.5 py-0.5 rounded-full">{likes.length}</span>
+                  )}
+                </div>
+                <button onClick={() => fetchLikes()} disabled={isFetchingLikes}
+                  className="circle-btn" style={{ width: 34, height: 34 }}>
+                  {isFetchingLikes ? <Loader2 className="w-4 h-4 animate-spin text-peach" /> : <RefreshCcw className="w-4 h-4 text-muted" />}
+                </button>
+              </div>
+
+              {likes.length === 0 && !isFetchingLikes && (
+                <div className="glass-card p-8 text-center">
+                  <ListMusic className="w-8 h-8 text-muted/40 mx-auto mb-3" />
+                  <p className="text-muted text-sm">No tracks</p>
+                  <p className="text-muted/60 text-xs mt-1">Paste a track or playlist URL above</p>
+                </div>
+              )}
+
+              <div ref={feedScrollRef} className="grid grid-cols-1 sm:grid-cols-2 gap-3 vibe-scroll" style={{ maxHeight: 'calc(100vh - 300px)', overflowY: 'auto', paddingRight: 4 }}>
+                {likes.map(track => {
+                  const isCurrentlyPlaying = player.track?.id === track.id;
+                  return (
+                    <div key={track.id} className={`track-card group ${isCurrentlyPlaying ? 'ring-1 ring-peach/30' : ''}`}>
+                      <div className="flex gap-3 mb-3">
+                        {/* Tap artwork → play */}
+                        <button onClick={() => playTrackInline(track)} disabled={isProcessing} className="flex-shrink-0">
+                          <img src={track.artwork_url || PLACEHOLDER_IMG}
+                            className={`w-12 h-12 rounded-xl object-cover bg-navy-deep cursor-pointer hover:opacity-80 transition-opacity ${isCurrentlyPlaying ? 'ring-2 ring-peach/50' : ''}`} alt="" />
+                        </button>
+                        {/* Tap title → play */}
+                        <button onClick={() => playTrackInline(track)} disabled={isProcessing}
+                          className="flex-1 min-w-0 flex flex-col justify-center text-left cursor-pointer">
+                          <div className={`font-semibold text-[13px] truncate transition-colors leading-tight ${isCurrentlyPlaying ? 'text-peach' : 'text-white group-hover:text-peach'}`}>{track.title}</div>
+                          <div className="text-[11px] text-muted truncate mt-0.5">{track.user.username}</div>
+                        </button>
+                      </div>
+                      <div className="flex gap-2 items-center">
+                        <button onClick={() => runExtraction(track, 'download')} disabled={isProcessing}
+                          className="pill-btn flex-1 justify-center text-white/80">
+                          {isProcessing && activeTrackId === track.id
+                            ? <><Loader2 className="w-3.5 h-3.5 animate-spin text-peach" /> Working</>
+                            : <><Download className="w-3.5 h-3.5" /> Download</>}
+                        </button>
+                        <button onClick={() => runExtraction(track, 'push')} disabled={isProcessing}
+                          className="pill-btn accent flex-1 justify-center">
+                          <Send className="w-3.5 h-3.5" /> Push
+                        </button>
+                        {/* Tiny link button → SoundCloud */}
+                        <a href={track.permalink_url} target="_blank" rel="noopener noreferrer"
+                          className="link-btn" title="Open on SoundCloud">
+                          <ExternalLink className="w-2.5 h-2.5" />
+                        </a>
+                      </div>
+                    </div>
+                  );
+                })}
+                {/* Loading more indicator */}
+                {isLoadingMore && (
+                  <div className="col-span-full flex justify-center py-4">
+                    <Loader2 className="w-5 h-5 animate-spin text-peach" />
+                  </div>
+                )}
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </main>
+
+      {/* ========== STICKY PLAYER FOOTER ========== */}
+      {player.blobUrl && (
+        <div className="fixed bottom-0 left-0 right-0 z-50" style={{ backdropFilter: 'blur(24px)', background: 'rgba(5,9,14,0.92)', borderTop: '1px solid rgba(255,255,255,0.06)' }}>
+          <div className="max-w-6xl mx-auto px-5 lg:px-10">
+            {/* Seek bar — full width thin line */}
+            <div className="pt-2 -mx-5 lg:-mx-10 px-5 lg:px-10">
+              <input type="range" min={0} max={duration || 0} step={0.1}
+                value={currentTime} onChange={handleSeek}
+                className="w-full h-1 appearance-none cursor-pointer rounded-full"
+                style={{
+                  background: `linear-gradient(to right, #F8E3D6 ${(currentTime / (duration || 1)) * 100}%, rgba(120,126,145,0.2) ${(currentTime / (duration || 1)) * 100}%)`,
+                  accentColor: '#F8E3D6',
+                }} />
+            </div>
+
+            <div className="flex items-center py-3">
+              {/* Track info — left */}
+              <div className="flex items-center gap-3 flex-1 min-w-0">
+                <img src={player.track?.artwork_url || PLACEHOLDER_IMG}
+                  className="w-10 h-10 rounded-lg object-cover flex-shrink-0" alt="" />
+                <div className="min-w-0">
+                  <div className="text-[13px] font-semibold text-white truncate">{player.track?.title}</div>
+                  <div className="text-[10px] text-muted truncate">{player.track?.user.username}</div>
+                </div>
+              </div>
+
+              {/* Controls — centered */}
+              <div className="flex items-center gap-1 justify-center">
+                <button onClick={() => setIsRepeat(!isRepeat)}
+                  className={`circle-btn ${isRepeat ? 'active' : ''}`}
+                  style={{ width: 36, height: 36 }}>
+                  <Repeat className="w-4 h-4" />
+                </button>
+
+                <button onClick={togglePlay}
+                  className="circle-btn active"
+                  style={{ width: 44, height: 44 }}>
+                  {isPlaying
+                    ? <Pause className="w-5 h-5 text-peach" />
+                    : <Play className="w-5 h-5 text-peach" style={{ marginLeft: 2 }} />}
+                </button>
+
+                <button onClick={() => playNextTrack()}
+                  className="circle-btn"
+                  style={{ width: 36, height: 36 }}>
+                  <SkipForward className="w-4 h-4" />
+                </button>
+              </div>
+
+              {/* Time + Download — right */}
+              <div className="flex items-center gap-3 flex-1 justify-end min-w-0">
+                <div className="hidden sm:flex text-[10px] font-mono text-muted gap-1">
+                  <span>{formatTime(currentTime)}</span>
+                  <span>/</span>
+                  <span>{formatTime(duration)}</span>
+                </div>
+                <button onClick={downloadCurrent}
+                  className="circle-btn"
+                  style={{ width: 36, height: 36 }}>
+                  <Download className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const root = createRoot(document.getElementById('root')!);
+root.render(<App />);

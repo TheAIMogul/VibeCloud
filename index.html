@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#13172A">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>VibeDown</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            navy: {
+              DEFAULT: '#13172A',
+              deep: '#05090E',
+              light: '#1a1f35',
+            },
+            muted: '#787E91',
+            peach: '#F8E3D6',
+            surface: 'rgba(255,255,255,0.04)',
+          },
+          fontFamily: {
+            sans: ['Poppins', 'sans-serif'],
+            mono: ['JetBrains Mono', 'monospace'],
+          },
+        },
+      },
+    }
+  </script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      background-color: #05090E;
+      color: #FFFFFF;
+      font-family: 'Poppins', sans-serif;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /* Ambient background gradient */
+    body::before {
+      content: '';
+      position: fixed;
+      top: -40%;
+      left: -20%;
+      width: 80%;
+      height: 80%;
+      background: radial-gradient(ellipse, rgba(248,227,214,0.03) 0%, transparent 70%);
+      pointer-events: none;
+      z-index: 0;
+    }
+    body::after {
+      content: '';
+      position: fixed;
+      bottom: -30%;
+      right: -20%;
+      width: 70%;
+      height: 70%;
+      background: radial-gradient(ellipse, rgba(120,126,145,0.04) 0%, transparent 70%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* Pill button outline style */
+    .pill-btn {
+      border: 1.5px solid rgba(255,255,255,0.25);
+      border-radius: 9999px;
+      padding: 8px 20px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      backdrop-filter: blur(8px);
+      background: rgba(255,255,255,0.03);
+    }
+    .pill-btn:hover:not(:disabled) {
+      border-color: rgba(255,255,255,0.5);
+      background: rgba(255,255,255,0.08);
+      transform: translateY(-1px);
+    }
+    .pill-btn:active:not(:disabled) {
+      transform: translateY(0);
+    }
+    .pill-btn:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+    .pill-btn.accent {
+      border-color: rgba(248,227,214,0.4);
+      color: #F8E3D6;
+    }
+    .pill-btn.accent:hover:not(:disabled) {
+      border-color: #F8E3D6;
+      background: rgba(248,227,214,0.08);
+      box-shadow: 0 0 20px rgba(248,227,214,0.08);
+    }
+
+    /* Circle icon button */
+    .circle-btn {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      border: 1.5px solid rgba(255,255,255,0.2);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      background: rgba(255,255,255,0.03);
+      flex-shrink: 0;
+    }
+    .circle-btn:hover {
+      border-color: rgba(255,255,255,0.5);
+      background: rgba(255,255,255,0.08);
+      transform: scale(1.05);
+    }
+    .circle-btn.active {
+      border-color: #F8E3D6;
+      background: rgba(248,227,214,0.08);
+      color: #F8E3D6;
+    }
+
+    /* Glass card */
+    .glass-card {
+      background: rgba(19,23,42,0.6);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 20px;
+      backdrop-filter: blur(20px);
+    }
+
+    /* Track card */
+    .track-card {
+      background: rgba(255,255,255,0.02);
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 16px;
+      padding: 14px;
+      transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .track-card:hover {
+      background: rgba(255,255,255,0.05);
+      border-color: rgba(255,255,255,0.1);
+      transform: translateY(-2px);
+    }
+
+    /* Custom scrollbar */
+    .vibe-scroll::-webkit-scrollbar { width: 3px; }
+    .vibe-scroll::-webkit-scrollbar-track { background: transparent; }
+    .vibe-scroll::-webkit-scrollbar-thumb { background: rgba(120,126,145,0.3); border-radius: 3px; }
+    .vibe-scroll::-webkit-scrollbar-thumb:hover { background: rgba(120,126,145,0.5); }
+
+    /* Input styles */
+    .vibe-input {
+      background: rgba(255,255,255,0.03);
+      border: 1.5px solid rgba(255,255,255,0.1);
+      border-radius: 9999px;
+      padding: 14px 24px;
+      font-family: 'Poppins', sans-serif;
+      font-size: 14px;
+      color: #FFFFFF;
+      outline: none;
+      transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      width: 100%;
+    }
+    .vibe-input::placeholder { color: #787E91; }
+    .vibe-input:focus {
+      border-color: rgba(248,227,214,0.4);
+      box-shadow: 0 0 0 3px rgba(248,227,214,0.05);
+    }
+
+    /* iOS Glassmorphism Console */
+    .console-glass {
+      background: rgba(30, 35, 55, 0.45);
+      border: 1px solid rgba(255,255,255,0.08);
+      backdrop-filter: blur(40px) saturate(180%);
+      -webkit-backdrop-filter: blur(40px) saturate(180%);
+      box-shadow:
+        0 8px 32px rgba(0,0,0,0.3),
+        inset 0 1px 0 rgba(255,255,255,0.06);
+    }
+
+    /* Tiny link button — max 15% of pill size */
+    .link-btn {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.15);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s ease;
+      background: rgba(255,255,255,0.03);
+      flex-shrink: 0;
+      color: #787E91;
+    }
+    .link-btn:hover {
+      border-color: rgba(248,227,214,0.5);
+      background: rgba(248,227,214,0.08);
+      color: #F8E3D6;
+      transform: scale(1.1);
+    }
+
+    .console-line {
+      display: flex;
+      gap: 10px;
+      padding: 2px 0;
+      font-size: 11px;
+      line-height: 1.5;
+    }
+
+    /* Fade in animation */
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .fade-up { animation: fadeUp 0.4s cubic-bezier(0.4, 0, 0.2, 1) forwards; }
+    .fade-up-1 { animation-delay: 0.05s; opacity: 0; }
+    .fade-up-2 { animation-delay: 0.1s; opacity: 0; }
+    .fade-up-3 { animation-delay: 0.15s; opacity: 0; }
+
+    /* Pulse dot */
+    @keyframes pulseDot {
+      0%, 100% { opacity: 0.3; transform: scale(0.8); }
+      50% { opacity: 1; transform: scale(1.2); }
+    }
+    .pulse-dot { animation: pulseDot 1.8s ease-in-out infinite; }
+
+    /* Config panel animation */
+    @keyframes slideDown {
+      from { opacity: 0; transform: translateY(-8px); max-height: 0; }
+      to { opacity: 1; transform: translateY(0); max-height: 300px; }
+    }
+    .slide-down { animation: slideDown 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards; }
+
+    /* Safe area padding for mobile */
+    .safe-bottom { padding-bottom: env(safe-area-inset-bottom, 16px); }
+  </style>
+<script type="importmap">
+{
+  "imports": {
+    "react/": "https://esm.sh/react@^19.2.3/",
+    "react": "https://esm.sh/react@^19.2.3",
+    "lucide-react": "https://esm.sh/lucide-react@^0.562.0",
+    "react-dom/": "https://esm.sh/react-dom@^19.2.3/",
+    "@google/genai": "https://esm.sh/@google/genai@^1.34.0"
+  }
+}
+</script>
+<link rel="stylesheet" href="/index.css">
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/index.tsx"></script>
+</body>
+</html>
