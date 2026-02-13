@@ -1,0 +1,39 @@
+# VibeDown Project Changelog & Issue Tracker
+
+## [Current Status] v2.1.0 - Cobalt v10 Architecture
+**System Status:** Operational
+**Key Features:** Serverless bridge (Cobalt v10), ID3 Tagging, Pushbullet Integration, Verbose Logging.
+
+---
+
+## Recent Updates
+
+### v2.1.0 (The "API Upgrade" Update)
+**Context:** Cobalt v7 API was deprecated/shutdown.
+**Changes:**
+1.  **API Migration:** Updated endpoint to `api.cobalt.tools` (v10).
+2.  **Payload Update:** Changed request structure to match v10 specs (`downloadMode`, `audioFormat`).
+3.  **Logging:** Added verbose network logging for deep debugging.
+4.  **Cleanup:** Removed legacy references to `yt-dlp`.
+
+### v2.0.0 (The "Bridge" Update)
+**Context:** Client-side scraping (HLS/Progressive) is brittle due to SoundCloud API changes. 
+**Changes:**
+1.  **Architecture:** Switched to remote extraction via **Cobalt API**.
+2.  **Reliability:** Extraction is now handled by a remote server.
+3.  **Authentication:** Removed the requirement for a user-supplied SoundCloud Client ID.
+4.  **Cost:** Utilization of the public Cobalt instance is free and requires no keys.
+
+### v1.3.0 (The "Magic Link" Update) [Deprecated]
+**Context:** User investigation of external tools revealed that they utilize the `progressive` stream protocol rather than HLS.
+**Status:** Replaced by v2.0.0 logic.
+
+---
+
+## Issue Log & Resolution History
+
+### 1. Instability with Advanced Features
+**Date:** [Previous]
+**Status:** Solved via Architecture Change
+**Diagnosis:** Client-side JS cannot easily handle complex stream stitching.
+**Fix:** Offloaded processing to Cobalt.
