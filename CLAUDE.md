@@ -1,4 +1,4 @@
-# VibeDown - SoundCloud Downloader
+# VibeCloud - SoundCloud Downloader
 
 ## Project Overview
 Client-side SoundCloud downloader built with React + TypeScript + Vite. Uses Cobalt API as a remote audio extraction bridge, enriches downloads with ID3 metadata, and optionally generates AI summaries via Gemini before pushing to devices via Pushbullet.
