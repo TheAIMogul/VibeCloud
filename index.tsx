@@ -12,7 +12,7 @@ import {
   ShieldAlert,
   Activity,
   Music2,
-  Headphones,
+  TreePalm,
   Zap,
   Play,
   Pause,
@@ -76,6 +76,36 @@ type PlayTrackOptions = {
   clearLogs?: boolean;
 };
 
+const EMPTY_PLAYER_STATE: PlayerState = {
+  track: null,
+  streamUrl: null,
+  blobUrl: null,
+  taggedBlob: null,
+  fileName: '',
+};
+
+const getStoredPlayerState = (): PlayerState => {
+  if (typeof window === 'undefined') return EMPTY_PLAYER_STATE;
+
+  const raw = window.localStorage.getItem('vibecloud-player');
+  if (!raw) return EMPTY_PLAYER_STATE;
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<PlayerState>;
+    const streamUrl = typeof parsed.streamUrl === 'string' && parsed.streamUrl.length > 0 ? parsed.streamUrl : null;
+    if (!parsed.track || !streamUrl) return EMPTY_PLAYER_STATE;
+
+    return {
+      ...EMPTY_PLAYER_STATE,
+      track: parsed.track,
+      streamUrl,
+      fileName: parsed.fileName ?? '',
+    };
+  } catch {
+    return EMPTY_PLAYER_STATE;
+  }
+};
+
 const App: React.FC = () => {
   const [url, setUrl] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
@@ -100,7 +130,7 @@ const App: React.FC = () => {
   const isLoadingMoreRef = useRef(false);
 
   // Audio player state
-  const [player, setPlayer] = useState<PlayerState>({ track: null, streamUrl: null, blobUrl: null, taggedBlob: null, fileName: '' });
+  const [player, setPlayer] = useState<PlayerState>(() => getStoredPlayerState());
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -139,6 +169,21 @@ const App: React.FC = () => {
   useEffect(() => {
     currentTrackIdRef.current = player.track?.id ?? null;
   }, [player.track?.id]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    if (!player.track || !player.streamUrl) {
+      window.localStorage.removeItem('vibecloud-player');
+      return;
+    }
+
+    window.localStorage.setItem('vibecloud-player', JSON.stringify({
+      track: player.track,
+      streamUrl: player.streamUrl,
+      fileName: player.fileName,
+    }));
+  }, [player.track, player.streamUrl, player.fileName]);
 
   // Audio player effects — auto-advance to next song
   useEffect(() => {
@@ -777,8 +822,11 @@ const App: React.FC = () => {
     </div>
   );
 
+  const hasPlayerSource = Boolean(player.streamUrl || player.blobUrl);
+  const hasTrack = Boolean(player.track);
+
   return (
-    <div className="min-h-screen relative z-10 flex flex-col" style={{ fontFamily: "'Poppins', sans-serif", paddingBottom: (player.streamUrl || player.blobUrl) ? 88 : 0 }}>
+    <div className="min-h-screen relative z-10 flex flex-col" style={{ fontFamily: "'Poppins', sans-serif", paddingBottom: 88 }}>
       {/* Hidden audio element */}
       <audio ref={audioRef} src={player.streamUrl || player.blobUrl || undefined} />
 
@@ -787,22 +835,33 @@ const App: React.FC = () => {
         <div className="max-w-6xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-full brand-mark flex items-center justify-center">
-              <Headphones className="w-5 h-5 text-peach" />
+              <TreePalm className="w-5 h-5 text-peach" />
             </div>
             <div>
               <h1 className="text-lg font-bold tracking-tight theme-text-primary leading-none">VibeCloud</h1>
-              <p className="text-[11px] text-muted font-medium tracking-wide mt-0.5">Direct Stream</p>
+              <p className="text-[10px] text-muted font-medium mt-1 max-w-[520px] leading-relaxed">
+                SC Music Downloader, a &quot;Micah Berkley&quot; (
+                <a
+                  href="https://micahberkley.com"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline decoration-muted/60 underline-offset-2 hover:text-peach"
+                >
+                  micahberkley.com
+                </a>
+                ) project. Use for your videos or projects. Respect the rights of the artist.
+              </p>
             </div>
           </div>
           <div className="flex items-center gap-2">
             <button
               onClick={toggleTheme}
-              className={`circle-btn ${theme === 'light' ? 'active' : ''}`}
+              className={`circle-btn theme-toggle-gold ${theme === 'light' ? 'active' : ''}`}
               title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
               aria-label="Toggle theme"
               style={{ width: 40, height: 40 }}
             >
-              {theme === 'dark' ? <Sun className="w-4 h-4 text-peach" /> : <Moon className="w-4 h-4 text-peach" />}
+              {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
             </button>
             <button onClick={() => setShowConfig(!showConfig)} className={`circle-btn ${showConfig ? 'active' : ''}`} style={{ width: 44, height: 44 }}>
               <Settings className="w-[18px] h-[18px]" />
@@ -944,77 +1003,88 @@ const App: React.FC = () => {
       </main>
 
       {/* ========== STICKY PLAYER FOOTER ========== */}
-      {(player.streamUrl || player.blobUrl) && (
-        <div className="fixed bottom-0 left-0 right-0 z-50 player-shell">
-          <div className="max-w-6xl mx-auto px-5 lg:px-10">
-            {/* Seek bar — full width thin line */}
-            <div className="pt-2 -mx-5 lg:-mx-10 px-5 lg:px-10">
-              <input type="range" min={0} max={duration || 0} step={0.1}
-                value={currentTime} onChange={handleSeek}
-                className="w-full h-1 appearance-none cursor-pointer rounded-full"
-                style={{
-                  background: `linear-gradient(to right, var(--seek-fill) ${(currentTime / (duration || 1)) * 100}%, var(--seek-empty) ${(currentTime / (duration || 1)) * 100}%)`,
-                  accentColor: 'var(--seek-fill)',
-                }} />
+      <div className="fixed bottom-0 left-0 right-0 z-50 player-shell">
+        <div className="max-w-6xl mx-auto px-5 lg:px-10">
+          {/* Seek bar — full width thin line */}
+          <div className="pt-2 -mx-5 lg:-mx-10 px-5 lg:px-10">
+            <input type="range" min={0} max={duration || 0} step={0.1}
+              value={currentTime} onChange={handleSeek}
+              disabled={!hasPlayerSource}
+              className="w-full h-1 appearance-none cursor-pointer rounded-full"
+              style={{
+                background: `linear-gradient(to right, var(--seek-fill) ${(currentTime / (duration || 1)) * 100}%, var(--seek-empty) ${(currentTime / (duration || 1)) * 100}%)`,
+                accentColor: 'var(--seek-fill)',
+              }} />
+          </div>
+
+          <div className="flex items-center py-3">
+            {/* Track info — left */}
+            <div className="flex items-center gap-3 flex-1 min-w-0">
+              {hasTrack ? (
+                <img
+                  src={player.track?.artwork_url || PLACEHOLDER_IMG}
+                  className="w-10 h-10 rounded-lg object-cover flex-shrink-0"
+                  alt=""
+                />
+              ) : (
+                <div className="w-10 h-10 rounded-lg brand-mark flex items-center justify-center flex-shrink-0">
+                  <TreePalm className="w-4 h-4 text-peach" />
+                </div>
+              )}
+              <div className="min-w-0">
+                <div className="text-[13px] font-semibold theme-text-primary truncate">{player.track?.title || 'No track loaded'}</div>
+                <div className="text-[10px] text-muted truncate">{player.track?.user.username || 'Pick a track to start playback'}</div>
+              </div>
             </div>
 
-            <div className="flex items-center py-3">
-              {/* Track info — left */}
-              <div className="flex items-center gap-3 flex-1 min-w-0">
-                <img src={player.track?.artwork_url || PLACEHOLDER_IMG}
-                  className="w-10 h-10 rounded-lg object-cover flex-shrink-0" alt="" />
-                <div className="min-w-0">
-                  <div className="text-[13px] font-semibold theme-text-primary truncate">{player.track?.title}</div>
-                  <div className="text-[10px] text-muted truncate">{player.track?.user.username}</div>
-                </div>
+            {/* Controls — centered */}
+            <div className="flex items-center gap-1 justify-center">
+              <button onClick={() => setIsRepeat(!isRepeat)}
+                disabled={!hasPlayerSource}
+                className={`circle-btn ${isRepeat ? 'active' : ''}`}
+                style={{ width: 36, height: 36 }}>
+                <Repeat className="w-4 h-4" />
+              </button>
+
+              <button onClick={togglePlay}
+                disabled={!hasPlayerSource}
+                className="circle-btn active"
+                style={{ width: 44, height: 44 }}>
+                {isPlaying
+                  ? <Pause className="w-5 h-5 text-peach" />
+                  : <Play className="w-5 h-5 text-peach" style={{ marginLeft: 2 }} />}
+              </button>
+
+              <button
+                onClick={() => { void playNextTrack('manual'); }}
+                disabled={!hasTrack || isSkippingNext}
+                className={`circle-btn ${(isSkippingNext || isPrefetchingNext) ? 'skip-loading' : ''}`}
+                style={{ width: 36, height: 36 }}
+                title={isPrefetchingNext ? "Preparing next track..." : "Skip to next"}
+              >
+                {(isSkippingNext || isPrefetchingNext)
+                  ? <Loader2 className="w-4 h-4 animate-spin text-peach" />
+                  : <SkipForward className="w-4 h-4" />}
+              </button>
+            </div>
+
+            {/* Time + Download — right */}
+            <div className="flex items-center gap-3 flex-1 justify-end min-w-0">
+              <div className="hidden sm:flex text-[10px] font-mono text-muted gap-1">
+                <span>{formatTime(currentTime)}</span>
+                <span>/</span>
+                <span>{formatTime(duration)}</span>
               </div>
-
-              {/* Controls — centered */}
-              <div className="flex items-center gap-1 justify-center">
-                <button onClick={() => setIsRepeat(!isRepeat)}
-                  className={`circle-btn ${isRepeat ? 'active' : ''}`}
-                  style={{ width: 36, height: 36 }}>
-                  <Repeat className="w-4 h-4" />
-                </button>
-
-                <button onClick={togglePlay}
-                  className="circle-btn active"
-                  style={{ width: 44, height: 44 }}>
-                  {isPlaying
-                    ? <Pause className="w-5 h-5 text-peach" />
-                    : <Play className="w-5 h-5 text-peach" style={{ marginLeft: 2 }} />}
-                </button>
-
-                <button
-                  onClick={() => { void playNextTrack('manual'); }}
-                  disabled={isSkippingNext}
-                  className={`circle-btn ${(isSkippingNext || isPrefetchingNext) ? 'skip-loading' : ''}`}
-                  style={{ width: 36, height: 36 }}
-                  title={isPrefetchingNext ? "Preparing next track..." : "Skip to next"}
-                >
-                  {(isSkippingNext || isPrefetchingNext)
-                    ? <Loader2 className="w-4 h-4 animate-spin text-peach" />
-                    : <SkipForward className="w-4 h-4" />}
-                </button>
-              </div>
-
-              {/* Time + Download — right */}
-              <div className="flex items-center gap-3 flex-1 justify-end min-w-0">
-                <div className="hidden sm:flex text-[10px] font-mono text-muted gap-1">
-                  <span>{formatTime(currentTime)}</span>
-                  <span>/</span>
-                  <span>{formatTime(duration)}</span>
-                </div>
-                <button onClick={downloadCurrent}
-                  className="circle-btn"
-                  style={{ width: 36, height: 36 }}>
-                  <Download className="w-4 h-4" />
-                </button>
-              </div>
+              <button onClick={downloadCurrent}
+                disabled={!hasTrack}
+                className="circle-btn"
+                style={{ width: 36, height: 36 }}>
+                <Download className="w-4 h-4" />
+              </button>
             </div>
           </div>
         </div>
-      )}
+      </div>
     </div>
   );
 };
