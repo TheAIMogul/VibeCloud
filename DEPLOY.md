@@ -1,4 +1,4 @@
-# VibeDown — Deployment Guide
+# VibeCloud — Deployment Guide
 
 ## Service Details
 
@@ -23,7 +23,7 @@
 
 ### One-Command Deploy
 
-From the project root (`~/dev/VibeDown`):
+From the project root (`~/dev/VibeCloud`):
 
 ```bash
 gcloud run deploy vibecloud-soundcloud-downloader \

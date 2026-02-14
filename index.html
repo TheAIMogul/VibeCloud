@@ -1,12 +1,12 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="theme-color" content="#13172A">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <title>VibeDown</title>
+  <title>VibeCloud</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
@@ -35,6 +35,34 @@
   </script>
   <style>
     * { box-sizing: border-box; }
+    :root {
+      --footer-bg: rgba(5,9,14,0.92);
+      --footer-border: rgba(255,255,255,0.06);
+      --seek-fill: #F8E3D6;
+      --seek-empty: rgba(120,126,145,0.2);
+      --theme-primary: #FFFFFF;
+      --theme-strong: rgba(255,255,255,0.9);
+      --theme-soft: rgba(255,255,255,0.6);
+      --brand-border: rgba(255,255,255,0.15);
+      --brand-bg: rgba(255,255,255,0.03);
+      --console-divider: rgba(255,255,255,0.06);
+      --count-chip-bg: rgba(255,255,255,0.05);
+    }
+
+    html[data-theme='light'] {
+      --footer-bg: rgba(244,247,255,0.92);
+      --footer-border: rgba(15,20,32,0.14);
+      --seek-fill: #F8E3D6;
+      --seek-empty: rgba(15,20,32,0.18);
+      --theme-primary: #0F141F;
+      --theme-strong: rgba(15,20,32,0.9);
+      --theme-soft: rgba(15,20,32,0.65);
+      --brand-border: rgba(15,20,32,0.2);
+      --brand-bg: rgba(255,255,255,0.9);
+      --console-divider: rgba(15,20,32,0.14);
+      --count-chip-bg: rgba(15,20,32,0.08);
+    }
+
     body {
       background-color: #05090E;
       color: #FFFFFF;
@@ -42,6 +70,16 @@
       overflow-x: hidden;
       -webkit-font-smoothing: antialiased;
       -moz-osx-font-smoothing: grayscale;
+    }
+
+    html[data-theme='dark'] body {
+      background-image:
+        linear-gradient(rgba(5,9,14,0.93), rgba(5,9,14,0.93)),
+        url('https://images.unsplash.com/photo-1748615514751-6a2c3ad81a72?w=3840&auto=format&fit=crop&q=80');
+      background-size: cover;
+      background-position: center;
+      background-repeat: no-repeat;
+      background-attachment: fixed;
     }
 
     /* Ambient background gradient */
@@ -129,6 +167,17 @@
       background: rgba(248,227,214,0.08);
       color: #F8E3D6;
     }
+    .circle-btn.skip-loading {
+      border-color: rgba(248,227,214,0.7) !important;
+      background-image: linear-gradient(
+        110deg,
+        rgba(248,227,214,0.18) 0%,
+        rgba(248,227,214,0.45) 45%,
+        rgba(248,227,214,0.18) 100%
+      ) !important;
+      background-size: 220% 100%;
+      animation: skipSweep 1.05s linear infinite;
+    }
 
     /* Glass card */
     .glass-card {
@@ -209,6 +258,129 @@
       transform: scale(1.1);
     }
 
+    .theme-text-primary { color: var(--theme-primary); }
+    .theme-text-strong { color: var(--theme-strong); }
+    .theme-text-soft { color: var(--theme-soft); }
+    .brand-mark {
+      border: 1px solid var(--brand-border);
+      background: var(--brand-bg);
+    }
+    .console-divider { border-color: var(--console-divider); }
+    .count-chip { background: var(--count-chip-bg); }
+    .player-shell {
+      backdrop-filter: blur(24px);
+      background: var(--footer-bg);
+      border-top: 1px solid var(--footer-border);
+    }
+
+    html[data-theme='light'] body {
+      background-color: #F8F9FC;
+      background-image:
+        linear-gradient(rgba(248,249,252,0.7), rgba(248,249,252,0.7)),
+        url('https://images.unsplash.com/photo-1741023705528-2953cb652705?q=80&w=2400&auto=format&fit=crop&ixlib=rb-4.1.0');
+      background-size: cover;
+      background-position: center;
+      background-repeat: no-repeat;
+      background-attachment: fixed;
+      color: #0F141F;
+    }
+    html[data-theme='light'] body::before {
+      background: none;
+      opacity: 0;
+    }
+    html[data-theme='light'] body::after {
+      top: 0;
+      right: 0;
+      bottom: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background:
+        radial-gradient(circle at 18% 20%, rgba(255,255,255,0.55) 0%, transparent 50%),
+        radial-gradient(circle at 82% 75%, rgba(248,227,214,0.35) 0%, transparent 45%);
+    }
+
+    html[data-theme='light'] .glass-card {
+      background: rgba(255,255,255,0.9);
+      border-color: rgba(15,20,32,0.12);
+      box-shadow: 0 25px 45px rgba(15,20,32,0.1);
+    }
+
+    html[data-theme='light'] .track-card {
+      background: rgba(255,255,255,0.85);
+      border-color: rgba(15,20,32,0.18);
+    }
+    html[data-theme='light'] .track-card:hover {
+      background: rgba(255,255,255,0.95);
+      border-color: rgba(15,20,32,0.25);
+    }
+
+    html[data-theme='light'] .vibe-input {
+      background: rgba(255,255,255,0.92);
+      border-color: rgba(15,20,32,0.18);
+      color: #0F141F;
+    }
+    html[data-theme='light'] .vibe-input::placeholder {
+      color: #8C95A8;
+    }
+    html[data-theme='light'] .vibe-input:focus {
+      border-color: rgba(248,227,214,0.4);
+      box-shadow: 0 0 0 3px rgba(248,227,214,0.12);
+    }
+
+    html[data-theme='light'] .pill-btn {
+      border-color: rgba(15,20,32,0.16);
+      background: rgba(255,255,255,0.8);
+      color: #0F141F;
+    }
+    html[data-theme='light'] .pill-btn:hover:not(:disabled) {
+      border-color: rgba(15,20,32,0.35);
+      background: rgba(0,0,0,0.04);
+    }
+    html[data-theme='light'] .pill-btn.accent {
+      border-color: rgba(248,227,214,0.5);
+      color: #0F141F;
+    }
+    html[data-theme='light'] .pill-btn.accent:hover:not(:disabled) {
+      border-color: rgba(248,227,214,0.8);
+      background: rgba(248,227,214,0.2);
+      box-shadow: 0 0 20px rgba(248,227,214,0.15);
+    }
+
+    html[data-theme='light'] .circle-btn {
+      border-color: rgba(15,20,32,0.3);
+      background: rgba(255,255,255,0.9);
+      color: #0F141F;
+    }
+    html[data-theme='light'] .circle-btn:hover {
+      border-color: rgba(15,20,32,0.6);
+      background: rgba(0,0,0,0.05);
+    }
+    html[data-theme='light'] .circle-btn.active {
+      border-color: #F8E3D6;
+      background: rgba(248,227,214,0.3);
+      color: #0F141F;
+    }
+    html[data-theme='light'] .circle-btn.skip-loading {
+      border-color: rgba(15,20,32,0.45) !important;
+      background-image: linear-gradient(
+        110deg,
+        rgba(248,227,214,0.28) 0%,
+        rgba(248,227,214,0.55) 45%,
+        rgba(248,227,214,0.28) 100%
+      ) !important;
+    }
+
+    html[data-theme='light'] .console-glass {
+      background: rgba(255,255,255,0.94);
+      border-color: rgba(10,12,16,0.2);
+      box-shadow: 0 12px 35px rgba(10,12,16,0.18);
+    }
+
+    html[data-theme='light'] .link-btn {
+      border-color: rgba(15,20,32,0.25);
+    }
+
     .console-line {
       display: flex;
       gap: 10px;
@@ -233,6 +405,11 @@
       50% { opacity: 1; transform: scale(1.2); }
     }
     .pulse-dot { animation: pulseDot 1.8s ease-in-out infinite; }
+
+    @keyframes skipSweep {
+      0% { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
 
     /* Config panel animation */
     @keyframes slideDown {

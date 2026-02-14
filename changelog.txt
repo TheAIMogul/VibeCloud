@@ -1,4 +1,4 @@
-# VibeDown Project Changelog & Issue Tracker
+# VibeCloud Project Changelog & Issue Tracker
 
 ## [Current Status] v2.1.0 - Cobalt v10 Architecture
 **System Status:** Operational
