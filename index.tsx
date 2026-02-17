@@ -618,22 +618,24 @@ const App: React.FC = () => {
       const streamUrl = await getProgressiveStreamUrl(fullTrackData || trackData);
       addLog("Stream acquired", "success");
 
+      const trackTitle = fullTrackData?.title || trackData?.title || "Extracted Audio";
+      const artistName = fullTrackData?.user?.username || trackData?.user?.username || "SoundCloud User";
+      const artUrl = fullTrackData?.artwork_url || trackData?.artwork_url;
+
+      // Parallel fetch: audio + artwork simultaneously
       addLog("Downloading...", "process");
-      const fileRes = await fetch(streamUrl);
+      const [fileRes, artRes] = await Promise.all([
+        fetch(streamUrl),
+        artUrl ? fetch(artUrl.replace('-large', '-t500x500')).catch(() => null) : Promise.resolve(null)
+      ]);
+
       if (!fileRes.ok) throw new Error(`Download failed (${fileRes.status})`);
       const audioBuffer = await fileRes.arrayBuffer();
       addLog(`${(audioBuffer.byteLength / 1024 / 1024).toFixed(1)} MB`, "info");
 
-      const trackTitle = fullTrackData?.title || trackData?.title || "Extracted Audio";
-      const artistName = fullTrackData?.user?.username || trackData?.user?.username || "SoundCloud User";
-      const artUrl = fullTrackData?.artwork_url || trackData?.artwork_url;
       let artworkBuffer: ArrayBuffer | null = null;
-
-      if (artUrl) {
-        try {
-          const artRes = await fetch(artUrl.replace('-large', '-t500x500'));
-          if (artRes.ok) artworkBuffer = await artRes.arrayBuffer();
-        } catch (e) {}
+      if (artRes?.ok) {
+        artworkBuffer = await artRes.arrayBuffer();
       }
 
       const fileName = `${trackTitle.replace(/[^a-z0-9 ]/gi, '').trim() || 'Track'}.mp3`;
@@ -645,9 +647,6 @@ const App: React.FC = () => {
       }
       writer.addTag();
       const taggedBlob = writer.getBlob();
-
-      if (player.blobUrl) window.URL.revokeObjectURL(player.blobUrl);
-      const blobUrl = window.URL.createObjectURL(taggedBlob);
       const playerTrack: SCTrack = {
         id: fullTrackData?.id || trackData?.id || Date.now(),
         title: trackTitle,
@@ -655,15 +654,30 @@ const App: React.FC = () => {
         artwork_url: artUrl || PLACEHOLDER_IMG,
         user: { username: artistName },
       };
-      setPlayer({ track: playerTrack, streamUrl: null, blobUrl, taggedBlob, fileName });
+      const audio = audioRef.current;
+      const hasActiveSource = Boolean(player.streamUrl || player.blobUrl);
+      const isActivelyPlaying = Boolean(audio && !audio.paused && hasActiveSource);
+      const canUpdatePlayerWithoutInterrupt = !isActivelyPlaying;
 
-      if (mode === 'download') {
+      if (canUpdatePlayerWithoutInterrupt) {
+        if (player.blobUrl) window.URL.revokeObjectURL(player.blobUrl);
+        const blobUrl = window.URL.createObjectURL(taggedBlob);
+        setPlayer({ track: playerTrack, streamUrl: null, blobUrl, taggedBlob, fileName });
+      }
+
+      const triggerBlobDownload = (blob: Blob, downloadName: string) => {
+        const downloadUrl = window.URL.createObjectURL(blob);
         const link = document.createElement('a');
-        link.href = blobUrl;
-        link.setAttribute('download', fileName);
+        link.href = downloadUrl;
+        link.setAttribute('download', downloadName);
         document.body.appendChild(link);
         link.click();
         link.remove();
+        window.setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 1000);
+      };
+
+      if (mode === 'download') {
+        triggerBlobDownload(taggedBlob, fileName);
         addLog(`Saved ${fileName}`, "success");
       } else {
         // Push mode
@@ -704,12 +718,7 @@ const App: React.FC = () => {
           addLog("Pushed!", "success");
         } catch (pushErr: any) {
           addLog(pushErr.message, "error");
-          const link = document.createElement('a');
-          link.href = blobUrl;
-          link.setAttribute('download', fileName);
-          document.body.appendChild(link);
-          link.click();
-          link.remove();
+          triggerBlobDownload(taggedBlob, fileName);
           addLog(`Saved locally as fallback: ${fileName}`, "warning");
         }
       }
@@ -770,7 +779,8 @@ const App: React.FC = () => {
     return `${m}:${sec.toString().padStart(2, '0')}`;
   };
 
-  const logColor = (type: LogEntry['type']) => {
+  // Memoized log color function
+  const logColor = useCallback((type: LogEntry['type']) => {
     switch(type) {
       case 'error': return 'text-red-400';
       case 'success': return 'text-emerald-400';
@@ -779,7 +789,7 @@ const App: React.FC = () => {
       case 'network': return 'text-muted';
       default: return 'theme-text-soft';
     }
-  };
+  }, []);
 
   // --- Foldable Console Component (iOS glassmorphism when open) ---
   const ConsolePanel = ({ compact = false }: { compact?: boolean }) => (

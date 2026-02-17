@@ -1,20 +1,78 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# VibeCloud
 
-# Run and deploy your AI Studio app
+VibeCloud is a SoundCloud utility app for streaming, downloading, and pushing tracks with metadata.
 
-This contains everything you need to run your app locally.
+## What it does
 
-View your app in AI Studio: https://ai.studio/apps/drive/1EDRrFTa8eDOxs_gWlzuEEMvbj0yLlKMR
+- Loads liked tracks from a target SoundCloud user.
+- Resolves tracks/playlists from pasted SoundCloud URLs.
+- Streams tracks directly in the in-app player.
+- Downloads tagged MP3 files (title, artist, artwork).
+- Pushes files to Pushbullet (with optional Gemini-generated vibe text).
+- Shows live operation/network logs in a foldable console.
 
-## Run Locally
+## UI highlights
 
-**Prerequisites:**  Node.js
+- Light/dark theme toggle.
+- Always-visible bottom player.
+- Auto-advance and repeat controls.
+- Next-track prefetch behavior to reduce skip delay.
+- Visual skip/loading indicator on next-track control.
 
+## Tech stack
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+- React + TypeScript
+- Vite
+- Tailwind classes + custom CSS
+- `browser-id3-writer` for MP3 tags
+- `@google/genai` for optional summary text
+
+## Local development
+
+Prerequisites:
+
+- Node.js 20+
+
+Install and run:
+
+```bash
+npm ci
+npm run dev
+```
+
+Build:
+
+```bash
+npm run build
+```
+
+Preview production build locally:
+
+```bash
+npm run preview
+```
+
+## Configuration
+
+- `pb_access_token` is stored in browser localStorage from the app settings panel.
+- Gemini API usage depends on your configured key/context for `@google/genai`.
+
+## Deployment (Cloud Run)
+
+Primary deployment instructions are in `DEPLOY.md`.
+
+Quick command:
+
+```bash
+gcloud run deploy vibecloud-soundcloud-downloader \
+  --source . \
+  --region us-west1 \
+  --project gen-lang-client-0831040732 \
+  --allow-unauthenticated \
+  --port 8080 \
+  --quiet
+```
+
+Production URL:
+
+- https://vibecloud.micahberkley.com
