@@ -82,6 +82,34 @@ interface StreamPlaybackPrepared {
 type PlayTrackOptions = {
   clearLogs?: boolean;
 };
+type FeedType = 'likes' | 'reposts';
+const FEED_LABELS: Record<FeedType, string> = {
+  likes: 'Liked Tracks',
+  reposts: 'Reposted Tracks',
+};
+const isStandardFeedLabel = (label: string) =>
+  Object.values(FEED_LABELS).includes(label as any);
+
+// Normalize SoundCloud collection items into SCTracks. Likes wrap as
+// { kind:'like', track }; reposts wrap as { type:'track-repost', track } or
+// { type:'playlist-repost', playlist:{ tracks:[...] } }. Pagination responses
+// have the same envelope, so the same extractor handles both pages.
+const extractTracks = (collection: any[], type: FeedType): SCTrack[] => {
+  if (!Array.isArray(collection)) return [];
+  if (type === 'likes') {
+    return collection.map((i: any) => i?.track).filter(Boolean);
+  }
+  return collection.flatMap((i: any) => {
+    if (!i) return [];
+    if (i.track) return [i.track]; // track-repost
+    if (i.playlist?.tracks?.length) {
+      // playlist-repost: SC inlines full track data for small playlists.
+      // Filter out stub tracks (id-only objects without a title).
+      return i.playlist.tracks.filter((t: any) => t?.title);
+    }
+    return [];
+  });
+};
 
 const EMPTY_PLAYER_STATE: PlayerState = {
   track: null,
@@ -123,6 +151,11 @@ const App: React.FC = () => {
   const [hasCloudKey, setHasCloudKey] = useState(false);
   const [activeTrackId, setActiveTrackId] = useState<number | null>(null);
   const [feedLabel, setFeedLabel] = useState('Liked Tracks');
+  const [feedType, setFeedType] = useState<FeedType>(() => {
+    if (typeof window === 'undefined') return 'likes';
+    const saved = window.localStorage.getItem('vibecloud-feed-type');
+    return saved === 'reposts' ? 'reposts' : 'likes';
+  });
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     if (typeof window === 'undefined') return 'dark';
@@ -162,7 +195,13 @@ const App: React.FC = () => {
     localStorage.setItem('pb_access_token', secrets.pbAccessToken);
   }, [secrets]);
 
-  useEffect(() => { checkKeyStatus(); fetchLikes(); }, []);
+  useEffect(() => { checkKeyStatus(); fetchFeed(feedType); }, []);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('vibecloud-feed-type', feedType);
+    }
+  }, [feedType]);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
@@ -288,17 +327,24 @@ const App: React.FC = () => {
 
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
 
-  const fetchLikes = async () => {
+  const buildFeedUrl = (type: FeedType): string => {
+    const base = `${SC_API_BASE}/${type === 'likes'
+      ? `users/${TARGET_USER_ID}/track_likes`
+      : `stream/users/${TARGET_USER_ID}/reposts`}`;
+    const offset = type === 'likes' ? '&offset=0' : '';
+    return `${base}?client_id=${KNOWN_GOOD_CLIENT_ID}&limit=${LIKES_PER_PAGE}${offset}&linked_partitioning=1&app_version=1770807155&app_locale=en`;
+  };
+
+  const fetchFeed = async (type: FeedType) => {
     setIsFetchingLikes(true);
-    addLog("Syncing feed...", "network");
+    addLog(`Syncing ${type === 'likes' ? 'likes' : 'reposts'}...`, "network");
     try {
-      const likesUrl = `${SC_API_BASE}/users/${TARGET_USER_ID}/track_likes?client_id=${KNOWN_GOOD_CLIENT_ID}&limit=${LIKES_PER_PAGE}&offset=0&linked_partitioning=1&app_version=1770807155&app_locale=en`;
-      const likesRes = await robustFetch(likesUrl);
-      const likesData = await likesRes.json();
-      const tracks = likesData.collection.map((item: any) => item.track).filter(Boolean);
+      const res = await robustFetch(buildFeedUrl(type));
+      const data = await res.json();
+      const tracks = extractTracks(data.collection, type);
       setLikes(tracks);
-      setNextHref(likesData.next_href || null);
-      setFeedLabel('Liked Tracks');
+      setNextHref(data.next_href || null);
+      setFeedLabel(FEED_LABELS[type]);
       addLog(`${tracks.length} tracks synced`, "success");
     } catch (error: any) {
       addLog(`Feed sync: ${error.message}`, "warning");
@@ -307,15 +353,32 @@ const App: React.FC = () => {
     }
   };
 
-  // Infinite scroll — load more
+  const switchFeed = (next: FeedType) => {
+    if (next === feedType || isFetchingLikes) return;
+    setFeedType(next);
+    setLikes([]);
+    setNextHref(null);
+    feedScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+    void fetchFeed(next);
+  };
+
+  // Infinite scroll — load more. Snapshot feedType so a mid-flight switch
+  // doesn't apply the wrong extractor to in-flight pagination data.
   const loadMore = async () => {
     if (!nextHref || isLoadingMoreRef.current) return;
     isLoadingMoreRef.current = true;
     setIsLoadingMore(true);
+    const typeAtRequest = feedType;
     try {
       const res = await robustFetch(`${nextHref}&client_id=${KNOWN_GOOD_CLIENT_ID}`);
       const data = await res.json();
-      const newTracks = (data.collection || []).map((item: any) => item.track || item).filter(Boolean);
+      // Bail if user switched feeds while this was in flight — extracted
+      // tracks would belong to the old feed and confuse the visible list.
+      if (typeAtRequest !== feedType) {
+        addLog(`Load more: feed switched, discarding`, "info");
+        return;
+      }
+      const newTracks = extractTracks(data.collection || [], typeAtRequest);
       setLikes(prev => [...prev, ...newTracks]);
       setNextHref(data.next_href || null);
       addLog(`+${newTracks.length} tracks loaded`, "info");
@@ -945,16 +1008,45 @@ const App: React.FC = () => {
 
             {/* ===== FEED (Right on desktop) ===== */}
             <div className="lg:col-span-3 fade-up fade-up-3">
-              <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-2">
-                  <Music2 className="w-4 h-4 text-peach" />
-                  <h2 className="text-sm font-semibold theme-text-strong">{feedLabel}</h2>
+              <div className="flex items-center justify-between mb-3 gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Music2 className="w-4 h-4 text-peach shrink-0" />
+                  {isStandardFeedLabel(feedLabel) ? (
+                    <div className="feed-pills flex items-center gap-1.5" role="tablist">
+                      <button
+                        onClick={() => switchFeed('likes')}
+                        disabled={isFetchingLikes}
+                        className={`pill-btn feed-pill ${feedType === 'likes' ? 'feed-pill-active' : ''}`}
+                        role="tab"
+                        aria-selected={feedType === 'likes'}
+                        aria-pressed={feedType === 'likes'}
+                      >
+                        Liked
+                      </button>
+                      <button
+                        onClick={() => switchFeed('reposts')}
+                        disabled={isFetchingLikes}
+                        className={`pill-btn feed-pill ${feedType === 'reposts' ? 'feed-pill-active' : ''}`}
+                        role="tab"
+                        aria-selected={feedType === 'reposts'}
+                        aria-pressed={feedType === 'reposts'}
+                      >
+                        Reposted
+                      </button>
+                    </div>
+                  ) : (
+                    <h2 className="text-sm font-semibold theme-text-strong truncate">{feedLabel}</h2>
+                  )}
                   {likes.length > 0 && (
-                    <span className="text-[10px] font-medium text-muted count-chip px-2.5 py-0.5 rounded-full">{likes.length}</span>
+                    <span className="text-[10px] font-medium text-muted count-chip px-2.5 py-0.5 rounded-full shrink-0">{likes.length}</span>
                   )}
                 </div>
-                <button onClick={() => fetchLikes()} disabled={isFetchingLikes}
-                  className="circle-btn" style={{ width: 34, height: 34 }}>
+                <button
+                  onClick={() => fetchFeed(feedType)}
+                  disabled={isFetchingLikes}
+                  className="circle-btn shrink-0" style={{ width: 34, height: 34 }}
+                  title="Refresh feed"
+                >
                   {isFetchingLikes ? <Loader2 className="w-4 h-4 animate-spin text-peach" /> : <RefreshCcw className="w-4 h-4 text-muted" />}
                 </button>
               </div>
@@ -1105,5 +1197,12 @@ const App: React.FC = () => {
   );
 };
 
-const root = createRoot(document.getElementById('root')!);
+// HMR-safe root: when Vite re-imports this module, reuse the existing
+// React root instead of calling createRoot on the same container twice
+// (which logs the "container has already been passed to createRoot" warning
+// and can leave the old React tree in place, masking state updates).
+const container = document.getElementById('root')!;
+const containerWithRoot = container as HTMLElement & { __appRoot?: ReturnType<typeof createRoot> };
+const root = containerWithRoot.__appRoot ?? createRoot(container);
+containerWithRoot.__appRoot = root;
 root.render(<App />);
