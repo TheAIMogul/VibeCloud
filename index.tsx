@@ -31,7 +31,7 @@ import { GoogleGenAI } from "@google/genai";
 import ID3Writer from 'https://esm.sh/browser-id3-writer@4.4.0';
 
 // --- Constants ---
-const KNOWN_GOOD_CLIENT_ID = 'kJ5grOxsTDFFctYx2ZQdQ7viN7EmoTKn';
+const KNOWN_GOOD_CLIENT_ID = 'REDACTED_SC_CLIENT_ID';
 const TARGET_USER_ID = '5402929';
 const DEFAULT_PB_ACCESS_TOKEN = 'REDACTED_PUSHBULLET_TOKEN';
 const SC_API_BASE = 'https://api-v2.soundcloud.com';
@@ -40,9 +40,16 @@ const LIKES_PER_PAGE = 24;
 const NEXT_TRACK_PREFETCH_SECONDS = 15;
 
 // --- Networking Layer ---
+// In `vite dev`, route through the local cors-proxy (cors-proxy/server.js on :8080)
+// so we don't depend on the deployed Cloud Run proxy's origin allowlist.
+// In production builds, use the deployed proxy.
+// @ts-ignore - import.meta.env is provided by Vite at build time
+const IS_DEV = Boolean(import.meta.env?.DEV);
+const CORS_PROXY_BASE = IS_DEV
+  ? 'http://localhost:8080'
+  : 'https://vibecloud-cors-proxy-765441234018.us-west1.run.app';
 const PROXY_GATES = [
-  { name: 'CORSProxy.io', fn: (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}` },
-  { name: 'AllOrigins', fn: (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}` }
+  { name: 'VibeProxy', fn: (url: string) => `${CORS_PROXY_BASE}/proxy?url=${encodeURIComponent(url)}` },
 ];
 
 // --- Types ---
@@ -697,7 +704,6 @@ const App: React.FC = () => {
 
           const uploadSlot = await uploadReq.json();
           const formData = new FormData();
-          Object.entries(uploadSlot.data).forEach(([key, value]) => formData.append(key, value as string));
           formData.append('file', taggedBlob, fileName);
           await fetch(uploadSlot.upload_url, { method: 'POST', body: formData });
 

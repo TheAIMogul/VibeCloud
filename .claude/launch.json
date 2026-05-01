@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "vibecloud-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "port": 5175
+    },
+    {
+      "name": "cors-proxy",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["cors-proxy/server.js"],
+      "port": 8080
+    }
+  ]
+}
