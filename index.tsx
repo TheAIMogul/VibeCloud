@@ -25,6 +25,8 @@ import {
   ExternalLink,
   Moon,
   Sun,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 // @ts-ignore
@@ -175,6 +177,13 @@ const App: React.FC = () => {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isRepeat, setIsRepeat] = useState(false);
+  const [volume, setVolume] = useState<number>(() => {
+    if (typeof window === 'undefined') return 0.8;
+    const saved = window.localStorage.getItem('vibecloud-volume');
+    return saved !== null ? parseFloat(saved) : 0.8;
+  });
+  const [isMuted, setIsMuted] = useState(false);
+  const [prevVolume, setPrevVolume] = useState(0.8);
   const [isPrefetchingNext, setIsPrefetchingNext] = useState(false);
   const [isSkippingNext, setIsSkippingNext] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -215,6 +224,18 @@ const App: React.FC = () => {
   useEffect(() => {
     currentTrackIdRef.current = player.track?.id ?? null;
   }, [player.track?.id]);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.volume = isMuted ? 0 : volume;
+  }, [volume, isMuted]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('vibecloud-volume', volume.toString());
+    }
+  }, [volume]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -825,6 +846,23 @@ const App: React.FC = () => {
     setCurrentTime(audio.currentTime);
   };
 
+  const handleVolumeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = parseFloat(e.target.value);
+    setVolume(val);
+    if (val > 0) {
+      setIsMuted(false);
+    }
+  };
+
+  const toggleMute = () => {
+    if (isMuted) {
+      setIsMuted(false);
+    } else {
+      setPrevVolume(volume);
+      setIsMuted(true);
+    }
+  };
+
   const downloadCurrent = async () => {
     if (player.blobUrl && player.fileName) {
       const link = document.createElement('a');
@@ -1176,13 +1214,43 @@ const App: React.FC = () => {
               </button>
             </div>
 
-            {/* Time + Download — right */}
+            {/* Time + Volume + Download — right */}
             <div className="flex items-center gap-3 flex-1 justify-end min-w-0">
               <div className="hidden sm:flex text-[10px] font-mono text-muted gap-1">
                 <span>{formatTime(currentTime)}</span>
                 <span>/</span>
                 <span>{formatTime(duration)}</span>
               </div>
+
+              {/* Volume Slider */}
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={toggleMute}
+                  className="circle-btn shrink-0"
+                  style={{ width: 36, height: 36 }}
+                  title={isMuted ? "Unmute" : "Mute"}
+                >
+                  {isMuted || volume === 0 ? (
+                    <VolumeX className="w-4 h-4 text-muted" />
+                  ) : (
+                    <Volume2 className="w-4 h-4 text-peach" />
+                  )}
+                </button>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={isMuted ? 0 : volume}
+                  onChange={handleVolumeChange}
+                  className="w-16 h-1 appearance-none cursor-pointer rounded-full"
+                  style={{
+                    background: `linear-gradient(to right, var(--seek-fill) ${(isMuted ? 0 : volume) * 100}%, var(--seek-empty) ${(isMuted ? 0 : volume) * 100}%)`,
+                    accentColor: 'var(--seek-fill)',
+                  }}
+                />
+              </div>
+
               <button onClick={downloadCurrent}
                 disabled={!hasTrack}
                 className="circle-btn"
