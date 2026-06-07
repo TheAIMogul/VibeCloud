@@ -1,0 +1,25 @@
+{
+  // VibeCloud — single Cloudflare Worker serving the built Vite SPA (static
+  // assets) and the SoundCloud CORS proxy (/proxy, /health). Replaces the two
+  // Google Cloud Run services. Deploy: `npm run deploy`.
+  "name": "vibecloud",
+  "main": "worker/index.js",
+  "compatibility_date": "2025-05-01",
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "./dist",
+    // Client-side app: serve index.html for any unmatched navigation path.
+    "not_found_handling": "single-page-application",
+    // Force the Worker to run for the proxy/health paths BEFORE the SPA asset
+    // fallback would otherwise swallow them and return index.html.
+    "run_worker_first": ["/proxy", "/health"]
+  },
+  // Bind the production hostname. theaimogul.com is an active zone on this same
+  // Cloudflare account, so Cloudflare auto-creates the DNS record + TLS cert.
+  "routes": [
+    { "pattern": "vibecloud.theaimogul.com", "custom_domain": true }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
