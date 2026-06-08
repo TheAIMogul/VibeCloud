@@ -33,23 +33,29 @@ import { GoogleGenAI } from "@google/genai";
 import ID3Writer from 'https://esm.sh/browser-id3-writer@4.4.0';
 
 // --- Constants ---
-const KNOWN_GOOD_CLIENT_ID = 'POy4x48uHpENQjixAeI9vTRMsXqo4LnX';
+// client_id is injected server-side by the Worker (SOUNDCLOUD_CLIENT_ID secret),
+// so it is intentionally empty here and never shipped in the client bundle.
+const KNOWN_GOOD_CLIENT_ID = '';
 const TARGET_USER_ID = '5402929';
-const DEFAULT_PB_ACCESS_TOKEN = 'o.KHQsxVhDhVxOGSX1ut8V4tOlDfjXeHSD';
+// Pushbullet is handled server-side by the Worker (PUSHBULLET_TOKEN secret). This
+// default is empty; a user may still set their own token in Settings (sent to the
+// Worker as a per-request override).
+const DEFAULT_PB_ACCESS_TOKEN = '';
 const SC_API_BASE = 'https://api-v2.soundcloud.com';
 const PLACEHOLDER_IMG = 'https://placehold.co/400x400/13172A/787E91?text=%E2%99%AA';
 const LIKES_PER_PAGE = 24;
 const NEXT_TRACK_PREFETCH_SECONDS = 15;
 
 // --- Networking Layer ---
-// In `vite dev`, route through the local cors-proxy (cors-proxy/server.js on :8080)
-// so we don't depend on a remote proxy's origin allowlist.
-// In production, the app is served by a Cloudflare Worker that also hosts the
-// /proxy endpoint, so we hit it same-origin (empty base => relative "/proxy").
+// The Cloudflare Worker hosts /proxy (with server-side client_id injection) and
+// the /api/pb/* endpoints. In production we hit it same-origin (empty base). In
+// `vite dev` we point at the deployed Worker, since the old local Node cors-proxy
+// can't inject the client_id or hold the Pushbullet secret. All Worker routes are
+// CORS-enabled, so cross-origin dev calls work.
 // @ts-ignore - import.meta.env is provided by Vite at build time
 const IS_DEV = Boolean(import.meta.env?.DEV);
 const CORS_PROXY_BASE = IS_DEV
-  ? 'http://localhost:8080'
+  ? 'https://vibecloud.theaimogul.com'
   : '';
 const PROXY_GATES = [
   { name: 'VibeProxy', fn: (url: string) => `${CORS_PROXY_BASE}/proxy?url=${encodeURIComponent(url)}` },
@@ -807,15 +813,18 @@ const App: React.FC = () => {
         triggerBlobDownload(taggedBlob, fileName);
         addLog(`Saved ${fileName}`, "success");
       } else {
-        // Push mode
+        // Push mode — the Pushbullet token lives server-side (Worker secret). An
+        // optional per-user token from Settings is passed through as an override.
         addLog("Pushing to Pushbullet...", "process");
-        const pbHeaders = { 'Access-Token': secrets.pbAccessToken, 'Content-Type': 'application/json' };
+        const pbToken = secrets.pbAccessToken || undefined;
+        const pbJson = (path: string, payload: Record<string, unknown>) =>
+          fetch(`${CORS_PROXY_BASE}/api/pb/${path}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...payload, token: pbToken }),
+          });
 
         try {
-          const uploadReq = await fetch('https://api.pushbullet.com/v2/upload-request', {
-            method: 'POST', headers: pbHeaders,
-            body: JSON.stringify({ file_name: fileName, file_type: 'audio/mpeg' })
-          });
+          const uploadReq = await pbJson('upload-request', { file_name: fileName, file_type: 'audio/mpeg' });
 
           if (uploadReq.status === 401 || uploadReq.status === 403) {
             throw new Error("Pushbullet token invalid or expired. Go to Settings and enter a valid token from pushbullet.com/#settings/account");
@@ -837,10 +846,7 @@ const App: React.FC = () => {
             vibeSummary = geminiResponse.text || vibeSummary;
           } catch (e) {}
 
-          await fetch('https://api.pushbullet.com/v2/pushes', {
-            method: 'POST', headers: pbHeaders,
-            body: JSON.stringify({ type: 'file', file_name: fileName, file_type: 'audio/mpeg', file_url: uploadSlot.file_url, body: vibeSummary })
-          });
+          await pbJson('push', { file_name: fileName, file_type: 'audio/mpeg', file_url: uploadSlot.file_url, body: vibeSummary });
           addLog("Pushed!", "success");
         } catch (pushErr: any) {
           addLog(pushErr.message, "error");
