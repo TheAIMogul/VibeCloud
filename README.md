@@ -57,22 +57,21 @@ npm run preview
 - `pb_access_token` is stored in browser localStorage from the app settings panel.
 - Gemini API usage depends on your configured key/context for `@google/genai`.
 
-## Deployment (Cloud Run)
+## Deployment (Cloudflare Workers)
 
-Primary deployment instructions are in `DEPLOY.md`.
+VibeCloud is hosted on a single Cloudflare Worker that serves the built SPA as
+static assets and hosts the SoundCloud CORS proxy at `/proxy`. Full instructions
+are in `DEPLOY.md`.
 
 Quick command:
 
 ```bash
-gcloud run deploy vibecloud-soundcloud-downloader \
-  --source . \
-  --region us-west1 \
-  --project gen-lang-client-0831040732 \
-  --allow-unauthenticated \
-  --port 8080 \
-  --quiet
+npm run deploy        # vite build && wrangler deploy
 ```
 
 Production URL:
 
-- https://vibecloud.micahberkley.com
+- https://vibecloud.theaimogul.com
+
+> Previously hosted on Google Cloud Run (`vibecloud.micahberkley.com`) — now
+> retired. See the "Legacy" section of `DEPLOY.md`.

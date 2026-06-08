@@ -33,23 +33,30 @@ import { GoogleGenAI } from "@google/genai";
 import ID3Writer from 'https://esm.sh/browser-id3-writer@4.4.0';
 
 // --- Constants ---
-const KNOWN_GOOD_CLIENT_ID = 'REDACTED_SC_CLIENT_ID';
+// client_id is injected server-side by the Worker (SOUNDCLOUD_CLIENT_ID secret),
+// so it is intentionally empty here and never shipped in the client bundle.
+const KNOWN_GOOD_CLIENT_ID = '';
 const TARGET_USER_ID = '5402929';
-const DEFAULT_PB_ACCESS_TOKEN = 'REDACTED_PUSHBULLET_TOKEN';
+// Pushbullet is handled server-side by the Worker (PUSHBULLET_TOKEN secret). This
+// default is empty; a user may still set their own token in Settings (sent to the
+// Worker as a per-request override).
+const DEFAULT_PB_ACCESS_TOKEN = '';
 const SC_API_BASE = 'https://api-v2.soundcloud.com';
 const PLACEHOLDER_IMG = 'https://placehold.co/400x400/13172A/787E91?text=%E2%99%AA';
 const LIKES_PER_PAGE = 24;
 const NEXT_TRACK_PREFETCH_SECONDS = 15;
 
 // --- Networking Layer ---
-// In `vite dev`, route through the local cors-proxy (cors-proxy/server.js on :8080)
-// so we don't depend on the deployed Cloud Run proxy's origin allowlist.
-// In production builds, use the deployed proxy.
+// The Cloudflare Worker hosts /proxy (with server-side client_id injection) and
+// the /api/pb/* endpoints. In production we hit it same-origin (empty base). In
+// `vite dev` we point at the deployed Worker, since the old local Node cors-proxy
+// can't inject the client_id or hold the Pushbullet secret. All Worker routes are
+// CORS-enabled, so cross-origin dev calls work.
 // @ts-ignore - import.meta.env is provided by Vite at build time
 const IS_DEV = Boolean(import.meta.env?.DEV);
 const CORS_PROXY_BASE = IS_DEV
-  ? 'http://localhost:8080'
-  : 'https://vibecloud-cors-proxy-765441234018.us-west1.run.app';
+  ? 'https://vibecloud.theaimogul.com'
+  : '';
 const PROXY_GATES = [
   { name: 'VibeProxy', fn: (url: string) => `${CORS_PROXY_BASE}/proxy?url=${encodeURIComponent(url)}` },
 ];
@@ -79,7 +86,8 @@ interface PlayerState {
 interface StreamPlaybackPrepared {
   playerTrack: SCTrack;
   fileName: string;
-  streamUrl: string;
+  blobUrl: string;
+  blob: Blob;
 }
 type PlayTrackOptions = {
   clearLogs?: boolean;
@@ -129,13 +137,11 @@ const getStoredPlayerState = (): PlayerState => {
 
   try {
     const parsed = JSON.parse(raw) as Partial<PlayerState>;
-    const streamUrl = typeof parsed.streamUrl === 'string' && parsed.streamUrl.length > 0 ? parsed.streamUrl : null;
-    if (!parsed.track || !streamUrl) return EMPTY_PLAYER_STATE;
+    if (!parsed.track) return EMPTY_PLAYER_STATE;
 
     return {
       ...EMPTY_PLAYER_STATE,
       track: parsed.track,
-      streamUrl,
       fileName: parsed.fileName ?? '',
     };
   } catch {
@@ -240,17 +246,16 @@ const App: React.FC = () => {
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
-    if (!player.track || !player.streamUrl) {
+    if (!player.track) {
       window.localStorage.removeItem('vibecloud-player');
       return;
     }
 
     window.localStorage.setItem('vibecloud-player', JSON.stringify({
       track: player.track,
-      streamUrl: player.streamUrl,
       fileName: player.fileName,
     }));
-  }, [player.track, player.streamUrl, player.fileName]);
+  }, [player.track, player.fileName]);
 
   // Audio player effects — auto-advance to next song
   useEffect(() => {
@@ -450,20 +455,55 @@ const App: React.FC = () => {
     return res.json();
   };
 
-  const getProgressiveStreamUrl = async (trackData: any): Promise<string> => {
+  const resolveStreamUrl = async (trackData: any): Promise<string> => {
     const transcodings = trackData?.media?.transcodings || [];
-    const progressive = transcodings.find((t: any) => t.format?.protocol === 'progressive' && t.format?.mime_type?.includes('audio/mpeg'));
-    const hlsMp3 = transcodings.find((t: any) => t.format?.protocol === 'hls' && t.format?.mime_type?.includes('audio/mpeg'));
-    const anyProg = transcodings.find((t: any) => t.format?.protocol === 'progressive');
-    const transcoding = progressive || hlsMp3 || anyProg;
+    const hlsMp3 = transcodings.find((t: any) => t.format?.protocol === 'hls' && t.format?.mime_type === 'audio/mpeg');
+    const hlsAac = transcodings.find((t: any) => t.format?.protocol === 'hls' && t.format?.mime_type?.includes('audio/mp4'));
+    const transcoding = hlsMp3 || hlsAac;
     if (!transcoding) throw new Error("No downloadable stream");
-    const streamApiUrl = `${transcoding.url}?client_id=${KNOWN_GOOD_CLIENT_ID}`;
+    const trackAuth = trackData?.track_authorization || '';
+    const streamApiUrl = `${transcoding.url}?client_id=${KNOWN_GOOD_CLIENT_ID}&track_authorization=${trackAuth}`;
     addLog(`Stream (${transcoding.preset})`, "network");
     const streamRes = await robustFetch(streamApiUrl);
     if (!streamRes.ok) throw new Error(`Stream failed (${streamRes.status})`);
     const streamData = await streamRes.json();
     if (!streamData.url) throw new Error("No stream URL");
     return streamData.url;
+  };
+
+  const fetchHlsAsBlob = async (playlistUrl: string): Promise<Blob> => {
+    const manifestRes = await fetch(playlistUrl);
+    if (!manifestRes.ok) throw new Error(`Manifest failed (${manifestRes.status})`);
+    const manifest = await manifestRes.text();
+    const lines = manifest.split('\n');
+
+    const initLine = lines.find(l => l.includes('#EXT-X-MAP:'));
+    let initUrl: string | null = null;
+    if (initLine) {
+      const match = initLine.match(/URI="([^"]+)"/);
+      if (match) initUrl = match[1];
+    }
+
+    const segmentUrls = lines.filter(l => l.trim().startsWith('https://'));
+    if (segmentUrls.length === 0) throw new Error("No segments in manifest");
+    addLog(`${segmentUrls.length} segments`, "info");
+
+    const batchSize = 6;
+    const buffers: ArrayBuffer[] = [];
+
+    if (initUrl) {
+      const initRes = await fetch(initUrl);
+      if (initRes.ok) buffers.push(await initRes.arrayBuffer());
+    }
+
+    for (let i = 0; i < segmentUrls.length; i += batchSize) {
+      const batch = segmentUrls.slice(i, i + batchSize);
+      const results = await Promise.all(batch.map(url => fetch(url).then(r => r.arrayBuffer())));
+      buffers.push(...results);
+    }
+
+    const isMp3 = playlistUrl.includes('.mp3') || manifest.includes('audio/mpeg');
+    return new Blob(buffers, { type: isMp3 ? 'audio/mpeg' : 'audio/mp4' });
   };
 
   const toFileName = (title: string) => `${title.replace(/[^a-z0-9 ]/gi, '').trim() || 'Track'}.mp3`;
@@ -494,11 +534,15 @@ const App: React.FC = () => {
       if (!silent) addLog(`"${fullTrackData.title}" - ${fullTrackData.user?.username}`, "success");
     }
 
-    const streamUrl = await getProgressiveStreamUrl(fullTrackData);
+    const playlistUrl = await resolveStreamUrl(fullTrackData);
+    if (!silent) addLog("Buffering...", "process");
+    const blob = await fetchHlsAsBlob(playlistUrl);
+    if (!silent) addLog(`${(blob.size / 1024 / 1024).toFixed(1)} MB`, "info");
     const playerTrack = toPlayerTrack(fullTrackData, targetUrl);
     return {
       playerTrack,
-      streamUrl,
+      blobUrl: window.URL.createObjectURL(blob),
+      blob,
       fileName: toFileName(playerTrack.title),
     };
   };
@@ -507,8 +551,8 @@ const App: React.FC = () => {
     revokePlayerBlobIfAny();
     setPlayer({
       track: prepared.playerTrack,
-      streamUrl: prepared.streamUrl,
-      blobUrl: null,
+      streamUrl: null,
+      blobUrl: prepared.blobUrl,
       taggedBlob: null,
       fileName: prepared.fileName,
     });
@@ -524,13 +568,12 @@ const App: React.FC = () => {
       addLog(`"${fullTrackData.title}" - ${fullTrackData.user?.username}`, "success");
     }
 
-    const streamUrl = await getProgressiveStreamUrl(fullTrackData);
+    const playlistUrl = await resolveStreamUrl(fullTrackData);
     addLog("Stream acquired", "success");
-    addLog("Buffering fallback...", "process");
+    addLog("Buffering...", "process");
 
-    const fileRes = await fetch(streamUrl);
-    if (!fileRes.ok) throw new Error(`Download failed (${fileRes.status})`);
-    const audioBuffer = await fileRes.arrayBuffer();
+    const audioBlob = await fetchHlsAsBlob(playlistUrl);
+    const audioBuffer = await audioBlob.arrayBuffer();
     addLog(`${(audioBuffer.byteLength / 1024 / 1024).toFixed(1)} MB`, "info");
 
     const trackTitle = fullTrackData?.title || track?.title || "Extracted Audio";
@@ -706,22 +749,21 @@ const App: React.FC = () => {
         if (!trackData) throw new Error("Cannot resolve track");
       }
 
-      const streamUrl = await getProgressiveStreamUrl(fullTrackData || trackData);
+      const resolvedData = fullTrackData || trackData;
+      const playlistUrl = await resolveStreamUrl(resolvedData);
       addLog("Stream acquired", "success");
 
       const trackTitle = fullTrackData?.title || trackData?.title || "Extracted Audio";
       const artistName = fullTrackData?.user?.username || trackData?.user?.username || "SoundCloud User";
       const artUrl = fullTrackData?.artwork_url || trackData?.artwork_url;
 
-      // Parallel fetch: audio + artwork simultaneously
       addLog("Downloading...", "process");
-      const [fileRes, artRes] = await Promise.all([
-        fetch(streamUrl),
+      const [audioBlob, artRes] = await Promise.all([
+        fetchHlsAsBlob(playlistUrl),
         artUrl ? fetch(artUrl.replace('-large', '-t500x500')).catch(() => null) : Promise.resolve(null)
       ]);
 
-      if (!fileRes.ok) throw new Error(`Download failed (${fileRes.status})`);
-      const audioBuffer = await fileRes.arrayBuffer();
+      const audioBuffer = await audioBlob.arrayBuffer();
       addLog(`${(audioBuffer.byteLength / 1024 / 1024).toFixed(1)} MB`, "info");
 
       let artworkBuffer: ArrayBuffer | null = null;
@@ -771,15 +813,18 @@ const App: React.FC = () => {
         triggerBlobDownload(taggedBlob, fileName);
         addLog(`Saved ${fileName}`, "success");
       } else {
-        // Push mode
+        // Push mode — the Pushbullet token lives server-side (Worker secret). An
+        // optional per-user token from Settings is passed through as an override.
         addLog("Pushing to Pushbullet...", "process");
-        const pbHeaders = { 'Access-Token': secrets.pbAccessToken, 'Content-Type': 'application/json' };
+        const pbToken = secrets.pbAccessToken || undefined;
+        const pbJson = (path: string, payload: Record<string, unknown>) =>
+          fetch(`${CORS_PROXY_BASE}/api/pb/${path}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...payload, token: pbToken }),
+          });
 
         try {
-          const uploadReq = await fetch('https://api.pushbullet.com/v2/upload-request', {
-            method: 'POST', headers: pbHeaders,
-            body: JSON.stringify({ file_name: fileName, file_type: 'audio/mpeg' })
-          });
+          const uploadReq = await pbJson('upload-request', { file_name: fileName, file_type: 'audio/mpeg' });
 
           if (uploadReq.status === 401 || uploadReq.status === 403) {
             throw new Error("Pushbullet token invalid or expired. Go to Settings and enter a valid token from pushbullet.com/#settings/account");
@@ -801,10 +846,7 @@ const App: React.FC = () => {
             vibeSummary = geminiResponse.text || vibeSummary;
           } catch (e) {}
 
-          await fetch('https://api.pushbullet.com/v2/pushes', {
-            method: 'POST', headers: pbHeaders,
-            body: JSON.stringify({ type: 'file', file_name: fileName, file_type: 'audio/mpeg', file_url: uploadSlot.file_url, body: vibeSummary })
-          });
+          await pbJson('push', { file_name: fileName, file_type: 'audio/mpeg', file_url: uploadSlot.file_url, body: vibeSummary });
           addLog("Pushed!", "success");
         } catch (pushErr: any) {
           addLog(pushErr.message, "error");
