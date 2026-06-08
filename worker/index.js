@@ -1,19 +1,21 @@
-// VibeCloud edge Worker — static SPA host + SoundCloud CORS proxy.
+// VibeCloud edge Worker — static SPA host + SoundCloud CORS proxy + private API.
 //
-// Replaces two Google Cloud Run services with one Cloudflare Worker:
-//   1. Static assets: the built Vite SPA is served from the ASSETS binding.
-//   2. CORS proxy:    /proxy?url=<encoded> forwards allow-listed SoundCloud
-//                     API calls (api-v2.soundcloud.com sends no CORS headers,
-//                     so the browser cannot call it cross-origin directly).
+// One Cloudflare Worker:
+//   1. Static assets: serves the built Vite SPA via the ASSETS binding.
+//   2. /proxy:        allow-listed CORS proxy to SoundCloud's API. Injects the
+//                     SoundCloud client_id (a Worker secret) so it never lives
+//                     in the client bundle / committed source.
+//   3. /api/pb/*:     Pushbullet upload-request + push, performed server-side
+//                     with a Worker secret token (so the token isn't shipped to
+//                     the browser). The large file upload itself stays
+//                     client-side (direct to Pushbullet's pre-signed S3 URL).
 //
-// This is a near-1:1 port of cors-proxy/server.js (Node http) to the Workers
-// fetch/Request/Response (Web Streams) model. Audio segments, artwork,
-// Pushbullet and Gemini still go DIRECT from the browser — they never touch
-// this Worker — so only small JSON metadata is proxied here.
+// Audio segments, artwork, the S3 upload, and the optional Gemini summary still
+// go DIRECT from the browser — only small JSON passes through this Worker.
 //
-// Routing: wrangler.jsonc sets `run_worker_first: ["/proxy","/health"]` so
-// those paths always hit this script; every other path is served as a static
-// asset (with SPA fallback to index.html) without invoking the Worker.
+// Secrets (wrangler secret put / .dev.vars):
+//   - SOUNDCLOUD_CLIENT_ID  injected into proxied SoundCloud API requests
+//   - PUSHBULLET_TOKEN      default token for /api/pb/* (client may override)
 
 const ALLOWED_TARGETS = [
   'api-v2.soundcloud.com',
@@ -22,31 +24,20 @@ const ALLOWED_TARGETS = [
   'api.pushbullet.com',
 ];
 
-// Hop-by-hop / identity headers we must not forward upstream (mirrors
-// server.js filterHeaders, plus Cloudflare-injected request headers).
+// SoundCloud API hosts that need the client_id injected.
+const SC_API_HOSTS = new Set(['api-v2.soundcloud.com', 'api.soundcloud.com']);
+
+// Hop-by-hop / identity headers we must not forward upstream.
 const SKIP_REQUEST_HEADERS = new Set([
-  'host',
-  'origin',
-  'referer',
-  'cookie',
-  'connection',
-  'cf-connecting-ip',
-  'cf-ipcountry',
-  'cf-ray',
-  'cf-visitor',
-  'cf-worker',
-  'x-forwarded-for',
-  'x-forwarded-proto',
-  'x-real-ip',
+  'host', 'origin', 'referer', 'cookie', 'connection',
+  'cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor', 'cf-worker',
+  'x-forwarded-for', 'x-forwarded-proto', 'x-real-ip',
 ]);
 
 function isTargetAllowed(hostname) {
   return ALLOWED_TARGETS.some((t) => hostname === t || hostname.endsWith('.' + t));
 }
 
-// CORS headers. The app is same-origin with this Worker in production (so CORS
-// is moot there), but we emit permissive headers so the proxy also works from
-// `vite dev` on localhost and any future origin.
 function applyCors(headers, request) {
   headers.set('Access-Control-Allow-Origin', '*');
   headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -61,17 +52,14 @@ function jsonError(status, message, request) {
   return new Response(JSON.stringify({ error: message }), { status, headers });
 }
 
-async function handleProxy(request) {
-  // CORS preflight.
+async function handleProxy(request, env) {
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: applyCors(new Headers(), request) });
   }
 
   const incoming = new URL(request.url);
   const targetUrl = incoming.searchParams.get('url');
-  if (!targetUrl) {
-    return jsonError(400, 'Bad request. Usage: /proxy?url=<encoded_url>', request);
-  }
+  if (!targetUrl) return jsonError(400, 'Bad request. Usage: /proxy?url=<encoded_url>', request);
 
   let target;
   try {
@@ -84,12 +72,14 @@ async function handleProxy(request) {
     return jsonError(403, `Target domain not allowed: ${target.hostname}`, request);
   }
 
-  // Forward method + (for non-GET) body, with filtered headers.
+  // Inject the SoundCloud client_id server-side (kept out of the client bundle).
+  if (env.SOUNDCLOUD_CLIENT_ID && SC_API_HOSTS.has(target.hostname)) {
+    target.searchParams.set('client_id', env.SOUNDCLOUD_CLIENT_ID);
+  }
+
   const upstreamHeaders = new Headers();
   for (const [key, value] of request.headers) {
-    if (!SKIP_REQUEST_HEADERS.has(key.toLowerCase())) {
-      upstreamHeaders.set(key, value);
-    }
+    if (!SKIP_REQUEST_HEADERS.has(key.toLowerCase())) upstreamHeaders.set(key, value);
   }
 
   const method = request.method;
@@ -107,14 +97,9 @@ async function handleProxy(request) {
     return jsonError(502, `Proxy error: ${err && err.message ? err.message : String(err)}`, request);
   }
 
-  // workerd's fetch() AUTO-DECOMPRESSES gzip/br upstream bodies but leaves the
-  // stale `Content-Encoding` (and compressed `Content-Length`) headers behind.
-  // Forwarding those verbatim makes the browser try to gunzip already-plaintext
-  // bytes -> ERR_CONTENT_DECODING_FAILED (SoundCloud's api-v2 serves gzipped
-  // JSON, and the client calls res.json() on every proxied response). So we copy
-  // the headers into a mutable set, drop the encoding/length headers (letting the
-  // runtime re-frame the body correctly), then layer CORS on top. The body itself
-  // still STREAMS straight through — no buffering, no 128MB memory pressure.
+  // workerd auto-decompresses gzip/br but leaves stale content-encoding/length
+  // headers; forwarding them stale breaks browser decoding. Drop them; the body
+  // streams straight through (no buffering).
   const responseHeaders = new Headers(upstream.headers);
   responseHeaders.delete('content-encoding');
   responseHeaders.delete('content-length');
@@ -127,6 +112,58 @@ async function handleProxy(request) {
   });
 }
 
+// Pushbullet calls that need the token, performed server-side with the secret.
+// `body.token` is an optional per-user override; otherwise env.PUSHBULLET_TOKEN.
+async function handlePushbullet(request, env, pbPath) {
+  if (request.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: applyCors(new Headers(), request) });
+  }
+  if (request.method !== 'POST') return jsonError(405, 'POST only', request);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonError(400, 'Invalid JSON body', request);
+  }
+
+  const token = (body && body.token) || env.PUSHBULLET_TOKEN;
+  if (!token) return jsonError(500, 'No Pushbullet token configured', request);
+
+  let payload;
+  if (pbPath === 'upload-request') {
+    payload = { file_name: body.file_name, file_type: body.file_type || 'audio/mpeg' };
+  } else {
+    // pushes
+    payload = {
+      type: 'file',
+      file_name: body.file_name,
+      file_type: body.file_type || 'audio/mpeg',
+      file_url: body.file_url,
+      body: body.body || '',
+    };
+  }
+
+  const endpoint = pbPath === 'upload-request'
+    ? 'https://api.pushbullet.com/v2/upload-request'
+    : 'https://api.pushbullet.com/v2/pushes';
+
+  let r;
+  try {
+    r = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Access-Token': token, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    return jsonError(502, `Pushbullet error: ${err && err.message ? err.message : String(err)}`, request);
+  }
+
+  const text = await r.text();
+  const headers = applyCors(new Headers({ 'Content-Type': 'application/json' }), request);
+  return new Response(text, { status: r.status, headers });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -134,17 +171,13 @@ export default {
     if (url.pathname === '/health') {
       return new Response('ok', { status: 200, headers: { 'Content-Type': 'text/plain' } });
     }
+    if (url.pathname === '/proxy') return handleProxy(request, env);
+    if (url.pathname === '/api/pb/upload-request') return handlePushbullet(request, env, 'upload-request');
+    if (url.pathname === '/api/pb/push') return handlePushbullet(request, env, 'pushes');
 
-    if (url.pathname === '/proxy') {
-      return handleProxy(request);
-    }
-
-    // Fallback: serve static assets (SPA). With run_worker_first scoped to
-    // /proxy and /health, normal asset/navigation requests are served by the
-    // platform directly and never reach here; this is a safety net.
-    if (env.ASSETS) {
-      return env.ASSETS.fetch(request);
-    }
+    // Static assets (SPA). With run_worker_first scoped to these API paths,
+    // normal asset/navigation requests are served by the platform directly.
+    if (env.ASSETS) return env.ASSETS.fetch(request);
     return new Response('Not found', { status: 404 });
   },
 };
