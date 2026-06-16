@@ -991,7 +991,7 @@ const App: React.FC = () => {
 
       {/* ========== HEADER ========== */}
       <header className="px-5 pt-5 pb-3 lg:px-10 lg:pt-7 fade-up">
-        <div className="max-w-6xl mx-auto flex items-center justify-between">
+        <div className="max-w-7xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-full brand-mark flex items-center justify-center">
               <TreePalm className="w-5 h-5 text-peach" />
@@ -1032,7 +1032,7 @@ const App: React.FC = () => {
       {/* ========== CONFIG ========== */}
       {showConfig && (
         <div className="px-5 lg:px-10 mb-3 slide-down">
-          <div className="max-w-6xl mx-auto glass-card p-5">
+          <div className="max-w-7xl mx-auto glass-card p-5">
             <label className="text-[10px] font-semibold text-muted uppercase tracking-widest mb-2 block">Pushbullet Token</label>
             <input type="password" value={tempSecrets.pbAccessToken}
               onChange={(e) => setTempSecrets({...tempSecrets, pbAccessToken: e.target.value})}
@@ -1052,7 +1052,7 @@ const App: React.FC = () => {
 
       {/* ========== MAIN ========== */}
       <main className="flex-1 px-5 lg:px-10 pb-4">
-        <div className="max-w-6xl mx-auto">
+        <div className="max-w-7xl mx-auto">
 
           {/* URL Input */}
           <div className="mb-4 fade-up fade-up-1">
@@ -1068,26 +1068,19 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          {/* Mobile console — compact, foldable, right under URL */}
-          <div className="lg:hidden mb-4 fade-up fade-up-2">
+          {/* Console — slim full-width collapsible bar above the feed.
+              Collapsed by default, so it no longer reserves a wide empty column. */}
+          <div className="mb-4 fade-up fade-up-2">
+            <div className="hidden lg:flex items-center gap-2 mb-2">
+              <Zap className="w-4 h-4 text-peach" />
+              <h2 className="text-sm font-semibold theme-text-strong">Console</h2>
+              {isProcessing && <div className="w-1.5 h-1.5 rounded-full bg-peach pulse-dot" />}
+            </div>
             <ConsolePanel compact />
           </div>
 
-          {/* Desktop: Console LEFT, Feed RIGHT */}
-          <div className="grid grid-cols-1 lg:grid-cols-5 gap-5">
-
-            {/* ===== CONSOLE (Left on desktop, foldable) ===== */}
-            <div className="hidden lg:block lg:col-span-2 fade-up fade-up-2">
-              <div className="flex items-center gap-2 mb-3">
-                <Zap className="w-4 h-4 text-peach" />
-                <h2 className="text-sm font-semibold theme-text-strong">Console</h2>
-                {isProcessing && <div className="w-1.5 h-1.5 rounded-full bg-peach pulse-dot" />}
-              </div>
-              <ConsolePanel />
-            </div>
-
-            {/* ===== FEED (Right on desktop) ===== */}
-            <div className="lg:col-span-3 fade-up fade-up-3">
+          {/* ===== FEED (full width, responsive columns) ===== */}
+          <div className="fade-up fade-up-3">
               <div className="flex items-center justify-between mb-3 gap-2">
                 <div className="flex items-center gap-2 min-w-0">
                   <Music2 className="w-4 h-4 text-peach shrink-0" />
@@ -1139,7 +1132,7 @@ const App: React.FC = () => {
                 </div>
               )}
 
-              <div ref={feedScrollRef} className="grid grid-cols-1 sm:grid-cols-2 gap-3 vibe-scroll" style={{ maxHeight: 'calc(100vh - 300px)', overflowY: 'auto', paddingRight: 4 }}>
+              <div ref={feedScrollRef} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-3 vibe-scroll" style={{ maxHeight: 'calc(100vh - 280px)', overflowY: 'auto', paddingRight: 4 }}>
                 {likes.map(track => {
                   const isCurrentlyPlaying = player.track?.id === track.id;
                   return (
@@ -1185,14 +1178,12 @@ const App: React.FC = () => {
                 )}
               </div>
             </div>
-
-          </div>
         </div>
       </main>
 
       {/* ========== STICKY PLAYER FOOTER ========== */}
       <div className="fixed bottom-0 left-0 right-0 z-50 player-shell">
-        <div className="max-w-6xl mx-auto px-5 lg:px-10">
+        <div className="max-w-7xl mx-auto px-5 lg:px-10">
           {/* Seek bar — full width thin line */}
           <div className="pt-2 -mx-5 lg:-mx-10 px-5 lg:px-10">
             <input type="range" min={0} max={duration || 0} step={0.1}
