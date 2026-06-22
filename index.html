@@ -72,14 +72,6 @@
       -moz-osx-font-smoothing: grayscale;
     }
 
-    /* Mobile/tablet density bump: shrink the entire UI ~25% so the iPhone
-       layout doesn't truncate titles, eat half the card with action pills,
-       or wrap the header to 4 lines. The desktop (lg+) layout has plenty
-       of breathing room and stays at full size. */
-    @media (max-width: 1023px) {
-      body { zoom: 0.75; }
-    }
-
     html[data-theme='dark'] body {
       background-image:
         linear-gradient(rgba(5,9,14,0.93), rgba(5,9,14,0.93)),
