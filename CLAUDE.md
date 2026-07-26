@@ -39,11 +39,14 @@ management library. One Cloudflare Worker backs it (static assets + `/proxy`).
 
 ### External Services
 - **SoundCloud API v2** — track metadata, liked/reposted feeds, stream
-  resolution (all proxied via the Worker `/proxy`).
+  resolution (all proxied via the Worker `/proxy`). **Auth requires BOTH a
+  `client_id` query param AND an `Authorization: OAuth <token>` header** — both
+  injected server-side by the Worker from secrets (the client sends neither).
 - **SoundCloud CDN** (`*.sndcdn.com`) — HLS manifest + audio segments + artwork
   (fetched directly by the browser, not proxied).
 - **Cloudflare Worker `/proxy`** — first-party allow-listed CORS proxy (replaces
-  the old public proxies and the Cloud Run Node proxy).
+  the old public proxies and the Cloud Run Node proxy). Injects `client_id`
+  (query) + `Authorization: OAuth` (header) for `api-v2/api.soundcloud.com`.
 - **Google Gemini** — AI summaries (optional, key baked into the client bundle).
 - **Pushbullet** — Cloud push notifications + S3 file upload (called directly).
 
@@ -76,7 +79,10 @@ npm run deploy   # vite build && wrangler deploy (to Cloudflare)
   `PROXY_GATES`.
 
 ## Known Considerations
-- Hardcoded SoundCloud client ID and user ID in source
+- Hardcoded SoundCloud user ID (`TARGET_USER_ID`) in source; `client_id` + OAuth
+  token are Worker secrets (not in source). The OAuth token is the owner's personal
+  SoundCloud session token and can expire/be revoked — see `INVESTIGATION.md` for
+  the refresh procedure if 401s return.
 - Pushbullet default token in source (user can override via settings)
 - GEMINI_API_KEY is inlined into the client bundle (publicly extractable) — move
   the Gemini call into the Worker + `wrangler secret put` if it must be private

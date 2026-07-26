@@ -27,6 +27,8 @@ import {
   Sun,
   Volume2,
   VolumeX,
+  CheckSquare,
+  Square,
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 // @ts-ignore
@@ -82,6 +84,9 @@ interface PlayerState {
   blobUrl: string | null;
   taggedBlob: Blob | null;
   fileName: string;
+  // Only a deliberate play request (tapping a track, auto-advance) sets this.
+  // Downloads load the track into the player without hijacking playback.
+  autoPlay: boolean;
 }
 interface StreamPlaybackPrepared {
   playerTrack: SCTrack;
@@ -127,6 +132,65 @@ const EMPTY_PLAYER_STATE: PlayerState = {
   blobUrl: null,
   taggedBlob: null,
   fileName: '',
+  autoPlay: false,
+};
+
+// --- Feed cache ---
+// Blob URLs and OAuth-signed stream data can't survive a reload, but the track
+// list can. Cache the trimmed SCTrack shape (not the raw SC payload) so stale
+// `track_authorization` values never come back from storage — a cached track
+// always re-resolves and gets a fresh token before playback.
+const FEED_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const FEED_CACHE_MAX_TRACKS = 600;
+const feedCacheKey = (type: FeedType) => `vibecloud-feed-${type}`;
+
+interface FeedCache {
+  tracks: SCTrack[];
+  nextHref: string | null;
+  scrollTop: number;
+  savedAt: number;
+}
+
+const trimTrack = (t: any): SCTrack => ({
+  id: t.id,
+  title: t.title,
+  permalink_url: t.permalink_url,
+  artwork_url: t.artwork_url || PLACEHOLDER_IMG,
+  user: { username: t.user?.username || 'SoundCloud User' },
+});
+
+const readFeedCache = (type: FeedType): FeedCache | null => {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(feedCacheKey(type));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as FeedCache;
+    if (!Array.isArray(parsed.tracks) || parsed.tracks.length === 0) return null;
+    if (Date.now() - (parsed.savedAt || 0) > FEED_CACHE_TTL_MS) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+};
+
+const writeFeedCache = (
+  type: FeedType,
+  tracks: SCTrack[],
+  nextHref: string | null,
+  scrollTop: number,
+) => {
+  if (typeof window === 'undefined') return;
+  try {
+    const payload: FeedCache = {
+      tracks: tracks.slice(0, FEED_CACHE_MAX_TRACKS).map(trimTrack),
+      nextHref,
+      scrollTop,
+      savedAt: Date.now(),
+    };
+    window.localStorage.setItem(feedCacheKey(type), JSON.stringify(payload));
+  } catch {
+    // Quota exceeded or storage disabled — caching is a nicety, never fatal.
+  }
 };
 
 const getStoredPlayerState = (): PlayerState => {
@@ -143,6 +207,7 @@ const getStoredPlayerState = (): PlayerState => {
       ...EMPTY_PLAYER_STATE,
       track: parsed.track,
       fileName: parsed.fileName ?? '',
+      autoPlay: false,
     };
   } catch {
     return EMPTY_PLAYER_STATE;
@@ -176,6 +241,18 @@ const App: React.FC = () => {
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const feedScrollRef = useRef<HTMLDivElement>(null);
   const isLoadingMoreRef = useRef(false);
+  // Scroll offset restored from cache, applied once the feed has rendered.
+  const pendingScrollRestoreRef = useRef<number | null>(null);
+  // Latest values for the debounced scroll writer, so it never re-registers.
+  const likesRef = useRef<SCTrack[]>([]);
+  const nextHrefRef = useRef<string | null>(null);
+  const feedTypeRef = useRef<FeedType>('likes');
+
+  // Multi-select
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
+  const cancelBulkRef = useRef(false);
 
   // Audio player state
   const [player, setPlayer] = useState<PlayerState>(() => getStoredPlayerState());
@@ -210,7 +287,21 @@ const App: React.FC = () => {
     localStorage.setItem('pb_access_token', secrets.pbAccessToken);
   }, [secrets]);
 
-  useEffect(() => { checkKeyStatus(); fetchFeed(feedType); }, []);
+  useEffect(() => {
+    checkKeyStatus();
+    // Restore the cached feed instead of refetching page 1 — this is what keeps
+    // a deep scroll position usable after a reload.
+    const cached = readFeedCache(feedType);
+    if (cached) {
+      setLikes(cached.tracks);
+      setNextHref(cached.nextHref);
+      setFeedLabel(FEED_LABELS[feedType]);
+      pendingScrollRestoreRef.current = cached.scrollTop;
+      addLog(`${cached.tracks.length} tracks from cache`, "info");
+    } else {
+      void fetchFeed(feedType);
+    }
+  }, []);
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -230,6 +321,10 @@ const App: React.FC = () => {
   useEffect(() => {
     currentTrackIdRef.current = player.track?.id ?? null;
   }, [player.track?.id]);
+
+  useEffect(() => { likesRef.current = likes; }, [likes]);
+  useEffect(() => { nextHrefRef.current = nextHref; }, [nextHref]);
+  useEffect(() => { feedTypeRef.current = feedType; }, [feedType]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -282,27 +377,75 @@ const App: React.FC = () => {
     };
   }, [isRepeat, likes, player.track]);
 
-  // Auto-play when blobUrl changes
+  // Load whenever the source changes, but only start playing if this source came
+  // from an explicit play request. A download loads the track without stealing
+  // playback from whatever the user is already listening to.
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio || (!player.streamUrl && !player.blobUrl)) return;
     audio.load();
+    if (!player.autoPlay) return;
     audio.play().then(() => setIsPlaying(true)).catch(() => {});
   }, [player.streamUrl, player.blobUrl]);
 
-  // Infinite scroll — preload at 70%
+  // Infinite scroll — preload at 70%, and remember where we were.
   useEffect(() => {
     const el = feedScrollRef.current;
     if (!el) return;
+    let scrollSaveTimer: number | undefined;
     const onScroll = () => {
       const scrollPercent = (el.scrollTop + el.clientHeight) / el.scrollHeight;
       if (scrollPercent >= 0.7 && nextHref && !isLoadingMoreRef.current && !isFetchingLikes) {
         loadMore();
       }
+      window.clearTimeout(scrollSaveTimer);
+      scrollSaveTimer = window.setTimeout(() => {
+        if (likesRef.current.length > 0) {
+          writeFeedCache(feedTypeRef.current, likesRef.current, nextHrefRef.current, el.scrollTop);
+        }
+      }, 250);
     };
     el.addEventListener('scroll', onScroll);
-    return () => el.removeEventListener('scroll', onScroll);
+    return () => {
+      window.clearTimeout(scrollSaveTimer);
+      el.removeEventListener('scroll', onScroll);
+    };
   }, [nextHref, isFetchingLikes]);
+
+  // Apply a restored scroll offset once the cached rows are actually in the DOM.
+  // Card heights settle over a few frames (artwork, fonts), so the container can
+  // still be too short to seek into on the first frame — retry until it fits.
+  useEffect(() => {
+    const target = pendingScrollRestoreRef.current;
+    if (target == null || target <= 0 || likes.length === 0) return;
+    const el = feedScrollRef.current;
+    if (!el) return;
+
+    // Timer-based rather than requestAnimationFrame: rAF is throttled to zero in
+    // background/offscreen tabs, which is exactly when a restore gets queued.
+    let attempts = 0;
+    let timer = 0;
+    const attempt = () => {
+      const maxScroll = el.scrollHeight - el.clientHeight;
+      if (maxScroll >= target || attempts++ > 20) {
+        el.scrollTop = Math.min(target, Math.max(maxScroll, 0));
+        pendingScrollRestoreRef.current = null;
+        return;
+      }
+      timer = window.setTimeout(attempt, 50);
+    };
+    attempt();
+    return () => window.clearTimeout(timer);
+  }, [likes.length]);
+
+  // Persist whenever the loaded set changes (new page, feed switch, refresh),
+  // preserving wherever the user currently is. Skipped while a restore is still
+  // pending — at that moment scrollTop is 0 and writing it would erase the very
+  // offset we're about to seek back to.
+  useEffect(() => {
+    if (likes.length === 0 || pendingScrollRestoreRef.current != null) return;
+    writeFeedCache(feedType, likes, nextHref, feedScrollRef.current?.scrollTop ?? 0);
+  }, [likes, nextHref, feedType]);
 
   const checkKeyStatus = async () => {
     // @ts-ignore
@@ -358,7 +501,7 @@ const App: React.FC = () => {
       ? `users/${TARGET_USER_ID}/track_likes`
       : `stream/users/${TARGET_USER_ID}/reposts`}`;
     const offset = type === 'likes' ? '&offset=0' : '';
-    return `${base}?client_id=${KNOWN_GOOD_CLIENT_ID}&limit=${LIKES_PER_PAGE}${offset}&linked_partitioning=1&app_version=1770807155&app_locale=en`;
+    return `${base}?client_id=${KNOWN_GOOD_CLIENT_ID}&limit=${LIKES_PER_PAGE}${offset}&linked_partitioning=1&app_version=1783486051&app_locale=en`;
   };
 
   const fetchFeed = async (type: FeedType) => {
@@ -371,6 +514,9 @@ const App: React.FC = () => {
       setLikes(tracks);
       setNextHref(data.next_href || null);
       setFeedLabel(FEED_LABELS[type]);
+      // A refresh replaces the list with page 1; don't strand the user mid-scroll.
+      pendingScrollRestoreRef.current = null;
+      feedScrollRef.current?.scrollTo({ top: 0 });
       addLog(`${tracks.length} tracks synced`, "success");
     } catch (error: any) {
       addLog(`Feed sync: ${error.message}`, "warning");
@@ -384,6 +530,20 @@ const App: React.FC = () => {
     setFeedType(next);
     setLikes([]);
     setNextHref(null);
+    setSelectedIds(new Set());
+
+    // Each feed keeps its own cached page set and scroll offset, so flipping
+    // tabs restores that feed where you left it rather than refetching page 1.
+    const cached = readFeedCache(next);
+    if (cached) {
+      setLikes(cached.tracks);
+      setNextHref(cached.nextHref);
+      setFeedLabel(FEED_LABELS[next]);
+      pendingScrollRestoreRef.current = cached.scrollTop;
+      addLog(`${cached.tracks.length} tracks from cache`, "info");
+      return;
+    }
+
     feedScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
     void fetchFeed(next);
   };
@@ -520,6 +680,17 @@ const App: React.FC = () => {
     };
   };
 
+  const triggerBlobDownload = (blob: Blob, downloadName: string) => {
+    const downloadUrl = window.URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = downloadUrl;
+    link.setAttribute('download', downloadName);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 1000);
+  };
+
   const revokePlayerBlobIfAny = () => {
     if (player.blobUrl) window.URL.revokeObjectURL(player.blobUrl);
   };
@@ -555,6 +726,7 @@ const App: React.FC = () => {
       blobUrl: prepared.blobUrl,
       taggedBlob: null,
       fileName: prepared.fileName,
+      autoPlay: true,
     });
   };
 
@@ -635,6 +807,7 @@ const App: React.FC = () => {
           blobUrl: fallbackPrepared.blobUrl,
           taggedBlob: fallbackPrepared.taggedBlob,
           fileName: fallbackPrepared.fileName,
+          autoPlay: true,
         });
         addLog(`Now playing (fallback)`, "success");
       } catch (fallbackError: any) {
@@ -787,27 +960,18 @@ const App: React.FC = () => {
         artwork_url: artUrl || PLACEHOLDER_IMG,
         user: { username: artistName },
       };
+      // Cue the finished track in the player (so it's one tap from playing, with
+      // no second download) but never start it — the user asked to download, not
+      // to listen. Skip entirely while something else is actively playing.
       const audio = audioRef.current;
       const hasActiveSource = Boolean(player.streamUrl || player.blobUrl);
       const isActivelyPlaying = Boolean(audio && !audio.paused && hasActiveSource);
-      const canUpdatePlayerWithoutInterrupt = !isActivelyPlaying;
 
-      if (canUpdatePlayerWithoutInterrupt) {
+      if (!isActivelyPlaying) {
         if (player.blobUrl) window.URL.revokeObjectURL(player.blobUrl);
         const blobUrl = window.URL.createObjectURL(taggedBlob);
-        setPlayer({ track: playerTrack, streamUrl: null, blobUrl, taggedBlob, fileName });
+        setPlayer({ track: playerTrack, streamUrl: null, blobUrl, taggedBlob, fileName, autoPlay: false });
       }
-
-      const triggerBlobDownload = (blob: Blob, downloadName: string) => {
-        const downloadUrl = window.URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = downloadUrl;
-        link.setAttribute('download', downloadName);
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        window.setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 1000);
-      };
 
       if (mode === 'download') {
         triggerBlobDownload(taggedBlob, fileName);
@@ -860,6 +1024,76 @@ const App: React.FC = () => {
       setIsProcessing(false);
       setActiveTrackId(null);
     }
+  };
+
+  // --- Multi-select ---
+  const toggleSelectMode = () => {
+    setSelectMode(prev => {
+      if (prev) setSelectedIds(new Set());
+      return !prev;
+    });
+  };
+
+  const toggleSelected = (trackId: number) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(trackId)) next.delete(trackId);
+      else next.add(trackId);
+      return next;
+    });
+  };
+
+  const selectAllVisible = () => setSelectedIds(new Set(likes.map(t => t.id)));
+  const clearSelection = () => setSelectedIds(new Set());
+
+  // Download the selected tracks one at a time. Sequential on purpose: each
+  // track pulls dozens of HLS segments, and browsers throttle (or silently drop)
+  // a burst of simultaneous downloads.
+  const downloadSelected = async () => {
+    if (isProcessing || selectedIds.size === 0) return;
+    const queue = likes.filter(t => selectedIds.has(t.id));
+    if (queue.length === 0) return;
+
+    cancelBulkRef.current = false;
+    setIsProcessing(true);
+    setLogs([]);
+    setBulkProgress({ done: 0, total: queue.length });
+    addLog(`Batch: ${queue.length} track${queue.length === 1 ? '' : 's'}`, "info");
+
+    let succeeded = 0;
+    let failed = 0;
+
+    for (let i = 0; i < queue.length; i++) {
+      if (cancelBulkRef.current) {
+        addLog(`Cancelled after ${i} of ${queue.length}`, "warning");
+        break;
+      }
+      const track = queue[i];
+      setActiveTrackId(track.id);
+      addLog(`[${i + 1}/${queue.length}] ${track.title}`, "process");
+      try {
+        const prepared = await prepareTaggedBlobPlayback(track);
+        // This path only saves the file — release the playback URL it created.
+        window.URL.revokeObjectURL(prepared.blobUrl);
+        triggerBlobDownload(prepared.taggedBlob, prepared.fileName);
+        addLog(`Saved ${prepared.fileName}`, "success");
+        succeeded++;
+        setSelectedIds(prev => {
+          const next = new Set(prev);
+          next.delete(track.id);
+          return next;
+        });
+      } catch (e: any) {
+        failed++;
+        addLog(`${track.title}: ${e.message}`, "error");
+      }
+      setBulkProgress({ done: i + 1, total: queue.length });
+    }
+
+    addLog(`Batch done — ${succeeded} saved${failed ? `, ${failed} failed` : ''}`, failed ? "warning" : "success");
+    setBulkProgress(null);
+    setActiveTrackId(null);
+    setIsProcessing(false);
   };
 
   // --- URL handler (playlist vs track) ---
@@ -1114,15 +1348,65 @@ const App: React.FC = () => {
                     <span className="text-[10px] font-medium text-muted count-chip px-2.5 py-0.5 rounded-full shrink-0">{likes.length}</span>
                   )}
                 </div>
-                <button
-                  onClick={() => fetchFeed(feedType)}
-                  disabled={isFetchingLikes}
-                  className="circle-btn shrink-0" style={{ width: 34, height: 34 }}
-                  title="Refresh feed"
-                >
-                  {isFetchingLikes ? <Loader2 className="w-4 h-4 animate-spin text-peach" /> : <RefreshCcw className="w-4 h-4 text-muted" />}
-                </button>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    onClick={toggleSelectMode}
+                    disabled={isProcessing}
+                    className={`circle-btn ${selectMode ? 'active' : ''}`}
+                    style={{ width: 34, height: 34 }}
+                    title={selectMode ? 'Exit multi-select' : 'Select multiple tracks'}
+                    aria-pressed={selectMode}
+                  >
+                    <CheckSquare className={`w-4 h-4 ${selectMode ? 'text-peach' : 'text-muted'}`} />
+                  </button>
+                  <button
+                    onClick={() => fetchFeed(feedType)}
+                    disabled={isFetchingLikes}
+                    className="circle-btn" style={{ width: 34, height: 34 }}
+                    title="Refresh feed"
+                  >
+                    {isFetchingLikes ? <Loader2 className="w-4 h-4 animate-spin text-peach" /> : <RefreshCcw className="w-4 h-4 text-muted" />}
+                  </button>
+                </div>
               </div>
+
+              {/* Bulk action bar — only while multi-select is on */}
+              {selectMode && (
+                <div className="select-bar mb-3">
+                  <span className="text-[11px] font-semibold theme-text-strong shrink-0">
+                    {selectedIds.size} selected
+                  </span>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <button onClick={selectAllVisible} disabled={isProcessing || likes.length === 0}
+                      className="pill-btn select-bar-btn">
+                      All {likes.length}
+                    </button>
+                    <button onClick={clearSelection} disabled={isProcessing || selectedIds.size === 0}
+                      className="pill-btn select-bar-btn">
+                      Clear
+                    </button>
+                  </div>
+                  <div className="flex-1" />
+                  {bulkProgress ? (
+                    <>
+                      <span className="text-[11px] font-mono text-muted shrink-0">
+                        {bulkProgress.done}/{bulkProgress.total}
+                      </span>
+                      <button onClick={() => { cancelBulkRef.current = true; }}
+                        className="pill-btn select-bar-btn">
+                        Cancel
+                      </button>
+                    </>
+                  ) : (
+                    <button onClick={downloadSelected}
+                      disabled={isProcessing || selectedIds.size === 0}
+                      className="pill-btn accent select-bar-btn">
+                      <Download className="w-3.5 h-3.5" />
+                      Download {selectedIds.size || ''}
+                    </button>
+                  )}
+                </div>
+              )}
 
               {likes.length === 0 && !isFetchingLikes && (
                 <div className="glass-card p-8 text-center">
@@ -1135,16 +1419,29 @@ const App: React.FC = () => {
               <div ref={feedScrollRef} className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-3 vibe-scroll" style={{ maxHeight: 'calc(100vh - 280px)', overflowY: 'auto', paddingRight: 4 }}>
                 {likes.map(track => {
                   const isCurrentlyPlaying = player.track?.id === track.id;
+                  const isSelected = selectedIds.has(track.id);
+                  // In select mode the whole card toggles selection instead of playing.
+                  const onCardTap = () => selectMode ? toggleSelected(track.id) : playTrackInline(track);
                   return (
-                    <div key={track.id} className={`track-card group ${isCurrentlyPlaying ? 'ring-1 ring-peach/30' : ''}`}>
-                      <div className="flex gap-3 mb-3">
-                        {/* Tap artwork → play */}
-                        <button onClick={() => playTrackInline(track)} disabled={isProcessing} className="flex-shrink-0">
+                    <div key={track.id}
+                      className={`track-card group ${isCurrentlyPlaying ? 'ring-1 ring-peach/30' : ''} ${isSelected ? 'track-card-selected' : ''}`}>
+                      <div className="flex gap-3 mb-3 items-center">
+                        {selectMode && (
+                          <button onClick={() => toggleSelected(track.id)} disabled={isProcessing}
+                            className="shrink-0" aria-pressed={isSelected}
+                            title={isSelected ? 'Deselect' : 'Select'}>
+                            {isSelected
+                              ? <CheckSquare className="w-5 h-5 text-peach" />
+                              : <Square className="w-5 h-5 text-muted" />}
+                          </button>
+                        )}
+                        {/* Tap artwork → play (or select) */}
+                        <button onClick={onCardTap} disabled={isProcessing} className="flex-shrink-0">
                           <img src={track.artwork_url || PLACEHOLDER_IMG}
                             className={`w-12 h-12 rounded-xl object-cover bg-navy-deep cursor-pointer hover:opacity-80 transition-opacity ${isCurrentlyPlaying ? 'ring-2 ring-peach/50' : ''}`} alt="" />
                         </button>
-                        {/* Tap title → play */}
-                        <button onClick={() => playTrackInline(track)} disabled={isProcessing}
+                        {/* Tap title → play (or select) */}
+                        <button onClick={onCardTap} disabled={isProcessing}
                           className="flex-1 min-w-0 flex flex-col justify-center text-left cursor-pointer">
                           <div className={`font-semibold text-[13px] truncate transition-colors leading-tight ${isCurrentlyPlaying ? 'text-peach' : 'theme-text-primary group-hover:text-peach'}`}>{track.title}</div>
                           <div className="text-[11px] text-muted truncate mt-0.5">{track.user.username}</div>

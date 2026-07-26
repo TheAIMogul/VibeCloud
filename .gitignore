@@ -17,6 +17,10 @@ dist-ssr
 .dev.vars
 .dev.vars.*
 
+# Contains the owner's live SoundCloud session OAuth token in plaintext.
+# This repo is public — never commit it.
+INVESTIGATION.md
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

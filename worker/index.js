@@ -14,8 +14,11 @@
 // go DIRECT from the browser — only small JSON passes through this Worker.
 //
 // Secrets (wrangler secret put / .dev.vars):
-//   - SOUNDCLOUD_CLIENT_ID  injected into proxied SoundCloud API requests
-//   - PUSHBULLET_TOKEN      default token for /api/pb/* (client may override)
+//   - SOUNDCLOUD_CLIENT_ID    injected into proxied SoundCloud API requests
+//   - SOUNDCLOUD_OAUTH_TOKEN  injected as the `Authorization: OAuth` header on
+//                             proxied SoundCloud API requests (SoundCloud now
+//                             requires BOTH client_id AND an OAuth header).
+//   - PUSHBULLET_TOKEN        default token for /api/pb/* (client may override)
 
 const ALLOWED_TARGETS = [
   'api-v2.soundcloud.com',
@@ -72,14 +75,24 @@ async function handleProxy(request, env) {
     return jsonError(403, `Target domain not allowed: ${target.hostname}`, request);
   }
 
+  const isScApi = SC_API_HOSTS.has(target.hostname);
+
   // Inject the SoundCloud client_id server-side (kept out of the client bundle).
-  if (env.SOUNDCLOUD_CLIENT_ID && SC_API_HOSTS.has(target.hostname)) {
+  if (env.SOUNDCLOUD_CLIENT_ID && isScApi) {
     target.searchParams.set('client_id', env.SOUNDCLOUD_CLIENT_ID);
   }
 
   const upstreamHeaders = new Headers();
   for (const [key, value] of request.headers) {
     if (!SKIP_REQUEST_HEADERS.has(key.toLowerCase())) upstreamHeaders.set(key, value);
+  }
+
+  // SoundCloud's API now requires an `Authorization: OAuth <token>` header in
+  // ADDITION to the client_id query param (client_id alone returns 401). Inject
+  // the token server-side from a Worker secret so it never ships to the browser.
+  // A client-provided Authorization header (if any) is overridden for SC hosts.
+  if (env.SOUNDCLOUD_OAUTH_TOKEN && isScApi) {
+    upstreamHeaders.set('Authorization', `OAuth ${env.SOUNDCLOUD_OAUTH_TOKEN}`);
   }
 
   const method = request.method;
@@ -127,8 +140,7 @@ async function handlePushbullet(request, env, pbPath) {
     return jsonError(400, 'Invalid JSON body', request);
   }
 
-  const token = (body && body.token) || env.PUSHBULLET_TOKEN;
-  if (!token) return jsonError(500, 'No Pushbullet token configured', request);
+  const clientToken = (body && body.token) || '';
 
   let payload;
   if (pbPath === 'upload-request') {
@@ -148,13 +160,21 @@ async function handlePushbullet(request, env, pbPath) {
     ? 'https://api.pushbullet.com/v2/upload-request'
     : 'https://api.pushbullet.com/v2/pushes';
 
+  // Try the client-supplied token first; if it's missing/invalid (401/403) fall
+  // back to the Worker secret so a stale token in the user's Settings never
+  // breaks the push (they just get the server's default account).
+  const tokens = [...new Set([clientToken, env.PUSHBULLET_TOKEN].filter(Boolean))];
+
   let r;
   try {
-    r = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Access-Token': token, 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    for (const tk of tokens) {
+      r = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Access-Token': tk, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.status !== 401 && r.status !== 403) break; // accept non-auth errors as final
+    }
   } catch (err) {
     return jsonError(502, `Pushbullet error: ${err && err.message ? err.message : String(err)}`, request);
   }
