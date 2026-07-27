@@ -29,6 +29,9 @@ import {
   VolumeX,
   CheckSquare,
   Square,
+  Bell,
+  BellOff,
+  Smartphone,
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
 // @ts-ignore
@@ -124,6 +127,49 @@ const extractTracks = (collection: any[], type: FeedType): SCTrack[] => {
     }
     return [];
   });
+};
+
+// --- PWA / notifications ---
+// Notifications are deliberately routed through the service worker rather than
+// `new Notification()`: Android Chrome throws on the page-level constructor and
+// only accepts ServiceWorkerRegistration.showNotification().
+const NOTIFY_PREF_KEY = 'vibecloud-notify';
+
+const isStandalone = () =>
+  typeof window !== 'undefined' &&
+  (window.matchMedia?.('(display-mode: standalone)').matches ||
+    (window.navigator as any).standalone === true);
+
+const isIOS = () =>
+  typeof navigator !== 'undefined' &&
+  (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    // iPadOS 13+ reports as Mac; the touch check disambiguates.
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
+
+// iOS only exposes the Notification API to Home Screen installs (16.4+), so a
+// browser-tab visit there genuinely cannot notify — say so rather than fail mute.
+const notificationsSupported = () =>
+  typeof window !== 'undefined' &&
+  'Notification' in window &&
+  'serviceWorker' in navigator;
+
+const registerServiceWorker = async () => {
+  if (typeof window === 'undefined' || !('serviceWorker' in navigator)) return;
+  try {
+    const reg = await navigator.serviceWorker.register('/sw.js', { scope: '/' });
+    // Activate a waiting update straight away; the shell is network-first, so
+    // there's no half-updated state to guard against.
+    reg.addEventListener('updatefound', () => {
+      const sw = reg.installing;
+      sw?.addEventListener('statechange', () => {
+        if (sw.state === 'installed' && navigator.serviceWorker.controller) {
+          sw.postMessage({ type: 'SKIP_WAITING' });
+        }
+      });
+    });
+  } catch {
+    // A failed registration costs the offline shell, not the app.
+  }
 };
 
 const EMPTY_PLAYER_STATE: PlayerState = {
@@ -248,6 +294,18 @@ const App: React.FC = () => {
   const nextHrefRef = useRef<string | null>(null);
   const feedTypeRef = useRef<FeedType>('likes');
 
+  // PWA / notifications
+  const [notifyEnabled, setNotifyEnabled] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return window.localStorage.getItem(NOTIFY_PREF_KEY) === '1';
+  });
+  const [notifyPermission, setNotifyPermission] = useState<NotificationPermission | 'unsupported'>(
+    () => (notificationsSupported() ? Notification.permission : 'unsupported'),
+  );
+  const [installPrompt, setInstallPrompt] = useState<any>(null);
+  // Read inside async download flows, where React state would be a stale closure.
+  const notifyEnabledRef = useRef(notifyEnabled);
+
   // Multi-select
   const [selectMode, setSelectMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
@@ -288,6 +346,26 @@ const App: React.FC = () => {
   }, [secrets]);
 
   useEffect(() => {
+    void registerServiceWorker();
+    // Chrome fires this instead of showing its own install UI; stash it so the
+    // Install button can replay it later from a user gesture.
+    const onBeforeInstall = (e: Event) => {
+      e.preventDefault();
+      setInstallPrompt(e);
+    };
+    const onInstalled = () => {
+      setInstallPrompt(null);
+      addLog('VibeCloud installed', 'success');
+    };
+    window.addEventListener('beforeinstallprompt', onBeforeInstall);
+    window.addEventListener('appinstalled', onInstalled);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', onBeforeInstall);
+      window.removeEventListener('appinstalled', onInstalled);
+    };
+  }, []);
+
+  useEffect(() => {
     checkKeyStatus();
     // Restore the cached feed instead of refetching page 1 — this is what keeps
     // a deep scroll position usable after a reload.
@@ -322,6 +400,7 @@ const App: React.FC = () => {
     currentTrackIdRef.current = player.track?.id ?? null;
   }, [player.track?.id]);
 
+  useEffect(() => { notifyEnabledRef.current = notifyEnabled; }, [notifyEnabled]);
   useEffect(() => { likesRef.current = likes; }, [likes]);
   useEffect(() => { nextHrefRef.current = nextHref; }, [nextHref]);
   useEffect(() => { feedTypeRef.current = feedType; }, [feedType]);
@@ -680,6 +759,58 @@ const App: React.FC = () => {
     };
   };
 
+  // Fire a system notification only when the user has actually switched away —
+  // if they're watching the console, the log line already told them.
+  const notifyIfHidden = async (title: string, body: string, tag = 'vibecloud-download') => {
+    if (!notifyEnabledRef.current) return;
+    if (typeof document === 'undefined' || document.visibilityState !== 'hidden') return;
+    if (!notificationsSupported() || Notification.permission !== 'granted') return;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      // Ask the SW to raise it — the page-level constructor is unavailable on
+      // Android Chrome, and this keeps one code path across platforms.
+      reg.active?.postMessage({ type: 'NOTIFY', title, body, tag });
+    } catch {
+      // Notification failure must never take a completed download down with it.
+    }
+  };
+
+  const enableNotifications = async () => {
+    if (!notificationsSupported()) {
+      addLog(
+        isIOS() && !isStandalone()
+          ? 'iOS: add VibeCloud to your Home Screen first, then enable notifications'
+          : 'Notifications not supported on this browser',
+        'warning',
+      );
+      return;
+    }
+    if (notifyEnabled) {
+      setNotifyEnabled(false);
+      window.localStorage.setItem(NOTIFY_PREF_KEY, '0');
+      addLog('Download notifications off', 'info');
+      return;
+    }
+    // Must be called from a user gesture, which is why this lives on a button.
+    const result = await Notification.requestPermission();
+    setNotifyPermission(result);
+    if (result === 'granted') {
+      setNotifyEnabled(true);
+      window.localStorage.setItem(NOTIFY_PREF_KEY, '1');
+      addLog('Download notifications on', 'success');
+    } else {
+      addLog(`Notification permission ${result}`, 'warning');
+    }
+  };
+
+  const handleInstall = async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    const { outcome } = await installPrompt.userChoice;
+    addLog(outcome === 'accepted' ? 'Installing VibeCloud...' : 'Install dismissed', 'info');
+    setInstallPrompt(null);
+  };
+
   const triggerBlobDownload = (blob: Blob, downloadName: string) => {
     const downloadUrl = window.URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -976,6 +1107,7 @@ const App: React.FC = () => {
       if (mode === 'download') {
         triggerBlobDownload(taggedBlob, fileName);
         addLog(`Saved ${fileName}`, "success");
+        void notifyIfHidden('Download complete', `${trackTitle} — ${artistName}`, `dl-${playerTrack.id}`);
       } else {
         // Push mode — the Pushbullet token lives server-side (Worker secret). An
         // optional per-user token from Settings is passed through as an override.
@@ -1012,6 +1144,7 @@ const App: React.FC = () => {
 
           await pbJson('push', { file_name: fileName, file_type: 'audio/mpeg', file_url: uploadSlot.file_url, body: vibeSummary });
           addLog("Pushed!", "success");
+          void notifyIfHidden('Pushed to your devices', `${trackTitle} — ${artistName}`, `push-${playerTrack.id}`);
         } catch (pushErr: any) {
           addLog(pushErr.message, "error");
           triggerBlobDownload(taggedBlob, fileName);
@@ -1091,6 +1224,15 @@ const App: React.FC = () => {
     }
 
     addLog(`Batch done — ${succeeded} saved${failed ? `, ${failed} failed` : ''}`, failed ? "warning" : "success");
+    // One summary rather than N notifications — a batch of 20 shouldn't bury
+    // the notification shade.
+    if (succeeded > 0) {
+      void notifyIfHidden(
+        `${succeeded} download${succeeded === 1 ? '' : 's'} complete`,
+        failed ? `${failed} failed — check the console` : 'All tracks saved',
+        'vibecloud-batch',
+      );
+    }
     setBulkProgress(null);
     setActiveTrackId(null);
     setIsProcessing(false);
@@ -1272,13 +1414,46 @@ const App: React.FC = () => {
               onChange={(e) => setTempSecrets({...tempSecrets, pbAccessToken: e.target.value})}
               className="vibe-input font-mono text-xs mb-4" style={{ borderRadius: 12 }} />
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex gap-3">
+              <div className="flex gap-3 flex-wrap">
                 <button onClick={handleConnectCloud} className="pill-btn text-muted">
                   <ShieldCheck className="w-3.5 h-3.5" /> {hasCloudKey ? 'AI Connected' : 'Connect AI'}
                 </button>
                 <button onClick={handleReset} className="pill-btn text-muted"><Undo className="w-3.5 h-3.5" /> Reset</button>
               </div>
               <button onClick={handleSaveConfig} className="pill-btn accent"><Save className="w-3.5 h-3.5" /> Save</button>
+            </div>
+
+            {/* App / notification settings */}
+            <div className="mt-5 pt-4 app-settings-divider">
+              <label className="text-[10px] font-semibold text-muted uppercase tracking-widest mb-3 block">App</label>
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  onClick={enableNotifications}
+                  className={`pill-btn ${notifyEnabled ? 'accent' : 'text-muted'}`}
+                  aria-pressed={notifyEnabled}
+                >
+                  {notifyEnabled
+                    ? <><Bell className="w-3.5 h-3.5" /> Notifications On</>
+                    : <><BellOff className="w-3.5 h-3.5" /> Notify on Download</>}
+                </button>
+
+                {installPrompt && (
+                  <button onClick={handleInstall} className="pill-btn accent">
+                    <Smartphone className="w-3.5 h-3.5" /> Install App
+                  </button>
+                )}
+                {!installPrompt && isStandalone() && (
+                  <span className="text-[10px] text-muted uppercase tracking-widest">Installed</span>
+                )}
+              </div>
+
+              <p className="text-[11px] text-muted mt-3 leading-relaxed">
+                {notifyPermission === 'denied'
+                  ? 'Notifications are blocked for this site — re-allow them in your browser settings, then try again.'
+                  : isIOS() && !isStandalone()
+                    ? 'On iPhone/iPad, add VibeCloud to your Home Screen first — iOS only allows notifications for installed apps.'
+                    : 'Alerts you when a download finishes while you’re in another app. Note that phones pause background tabs, so a download may not finish until you return.'}
+              </p>
             </div>
           </div>
         </div>
