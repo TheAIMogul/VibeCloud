@@ -1,0 +1,33 @@
+{
+  "name": "VibeCloud — SoundCloud Downloader",
+  "short_name": "VibeCloud",
+  "description": "Stream and download SoundCloud tracks with ID3 tags, then push them to your devices.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#13172A",
+  "theme_color": "#13172A",
+  "categories": ["music", "utilities"],
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
