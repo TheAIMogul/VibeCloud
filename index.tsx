@@ -1668,8 +1668,9 @@ const App: React.FC = () => {
               }} />
           </div>
 
-          <div className="flex items-center py-3">
-            {/* Track info — left */}
+          <div className="flex items-center gap-2 py-3">
+            {/* Track info — left. The only region allowed to give up width: the
+                title truncates before any control can be squeezed. */}
             <div className="flex items-center gap-3 flex-1 min-w-0">
               {hasTrack ? (
                 <img
@@ -1689,7 +1690,7 @@ const App: React.FC = () => {
             </div>
 
             {/* Controls — centered */}
-            <div className="flex items-center gap-1 justify-center">
+            <div className="flex items-center gap-1 justify-center shrink-0">
               <button onClick={() => setIsRepeat(!isRepeat)}
                 disabled={!hasPlayerSource}
                 className={`circle-btn ${isRepeat ? 'active' : ''}`}
@@ -1719,8 +1720,12 @@ const App: React.FC = () => {
               </button>
             </div>
 
-            {/* Time + Volume + Download — right */}
-            <div className="flex items-center gap-3 flex-1 justify-end min-w-0">
+            {/* Time + Volume + Download — right. Never min-w-0 here: squeezed below
+                its content with justify-end, this cluster overflows *leftward* over
+                the transport controls (the skip/mute overlap on phones). Content-sized
+                on phones so the title gets the slack; flex-1 on sm+ to keep the
+                transport centered. */}
+            <div className="flex items-center gap-3 flex-none sm:flex-1 justify-end">
               <div className="hidden sm:flex text-[10px] font-mono text-muted gap-1">
                 <span>{formatTime(currentTime)}</span>
                 <span>/</span>
@@ -1748,7 +1753,9 @@ const App: React.FC = () => {
                   step={0.01}
                   value={isMuted ? 0 : volume}
                   onChange={handleVolumeChange}
-                  className="w-16 h-1 appearance-none cursor-pointer rounded-full"
+                  // Phones set volume with the hardware buttons; the slider only
+                  // earns its 64px on sm+ screens.
+                  className="hidden sm:block w-16 h-1 appearance-none cursor-pointer rounded-full"
                   style={{
                     background: `linear-gradient(to right, var(--seek-fill) ${(isMuted ? 0 : volume) * 100}%, var(--seek-empty) ${(isMuted ? 0 : volume) * 100}%)`,
                     accentColor: 'var(--seek-fill)',
