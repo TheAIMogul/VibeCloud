@@ -15,6 +15,7 @@ summaries via Gemini before pushing to devices via Pushbullet. Hosted on
 - **Lucide React** — Icons
 - **@google/genai** — Gemini for AI "vibe check" summaries
 - **browser-id3-writer** (ESM import from esm.sh) — MP3 ID3 tagging
+- **hls.js** (light build, lazy-loaded chunk) — streaming playback over MediaSource
 - **Cloudflare Worker** (`worker/index.js`) — serves the SPA's static assets and
   hosts the `/proxy` CORS bridge to SoundCloud. (Audio segments, artwork,
   Pushbullet and Gemini calls still go directly from the browser.)
@@ -27,8 +28,13 @@ management library. One Cloudflare Worker backs it (static assets + `/proxy`).
 1. User pastes a SoundCloud URL or picks from the liked/reposted feed.
 2. Metadata resolved via SoundCloud API v2 (through the Worker `/proxy`).
 3. Stream URL resolved from the track's HLS transcoding (through `/proxy`); the
-   HLS manifest + segments are then fetched **directly** from `*.sndcdn.com` and
-   concatenated into an MP3/MP4 blob in the browser.
+   HLS manifest + segments are then fetched **directly** from `*.sndcdn.com`.
+   - **Playback** streams them through hls.js (native HLS where MediaSource is
+     missing), starting from the ~2 s first chunk. Signed playlist links expire
+     ~5 min after issue and chunk links ~2 h: fatal 401/403/410 re-resolves and
+     resumes in place; anything unrecoverable falls back to buffering the whole
+     file.
+   - **Download/Push** concatenate every segment into an MP3/MP4 blob.
 4. ID3 tags injected (title, artist, cover art).
 5. Output: direct download OR Pushbullet push with optional AI summary.
 

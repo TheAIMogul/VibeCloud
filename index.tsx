@@ -34,6 +34,8 @@ import {
   Smartphone,
 } from 'lucide-react';
 import { GoogleGenAI } from "@google/genai";
+import type Hls from 'hls.js';
+import type { ErrorData } from 'hls.js';
 // @ts-ignore
 import ID3Writer from 'https://esm.sh/browser-id3-writer@4.4.0';
 
@@ -50,6 +52,35 @@ const SC_API_BASE = 'https://api-v2.soundcloud.com';
 const PLACEHOLDER_IMG = 'https://placehold.co/400x400/13172A/787E91?text=%E2%99%AA';
 const LIKES_PER_PAGE = 24;
 const NEXT_TRACK_PREFETCH_SECONDS = 15;
+
+// --- Streaming playback ---
+// Playback streams SoundCloud's HLS through hls.js instead of downloading the whole
+// file first. Even the light build (no DRM, subtitles or alternate audio, which these
+// audio-only streams never use) is ~386 KB minified, so it loads on demand and is
+// warmed shortly after launch rather than shipped in the main bundle.
+let hlsModulePromise: Promise<typeof Hls> | null = null;
+const loadHls = (): Promise<typeof Hls> => {
+  hlsModulePromise ??= import('hls.js/light')
+    .then((m) => m.default as unknown as typeof Hls)
+    .catch((err) => {
+      hlsModulePromise = null; // let a later play retry, e.g. after coming back online
+      throw err;
+    });
+  return hlsModulePromise;
+};
+
+// Start from the tiny first chunk (~2 s of audio), then buffer far ahead so a song
+// that has started keeps playing through a dropped signal. backBufferLength caps
+// memory on hour-long mixes.
+const HLS_CONFIG = {
+  maxBufferLength: 300,
+  maxMaxBufferLength: 600,
+  backBufferLength: 90,
+};
+
+// SoundCloud's signed playlist links expire ~5 minutes after issue (chunk links last
+// ~2 hours). A link prepared ahead of time but older than this is resolved again.
+const STREAM_URL_MAX_AGE_MS = 4 * 60 * 1000;
 
 // --- Networking Layer ---
 // The Cloudflare Worker hosts /proxy (with server-side client_id injection) and
@@ -94,8 +125,9 @@ interface PlayerState {
 interface StreamPlaybackPrepared {
   playerTrack: SCTrack;
   fileName: string;
-  blobUrl: string;
-  blob: Blob;
+  // Signed HLS playlist link; goes stale per STREAM_URL_MAX_AGE_MS.
+  streamUrl: string;
+  preparedAt: number;
 }
 type PlayTrackOptions = {
   clearLogs?: boolean;
@@ -332,6 +364,12 @@ const App: React.FC = () => {
   const prefetchInFlightTrackIdRef = useRef<number | null>(null);
   const prefetchTriggeredForTrackIdRef = useRef<number | null>(null);
   const currentTrackIdRef = useRef<number | null>(null);
+  // Where to pick up when a source is swapped mid-song (refreshed link, buffering
+  // fallback). Tied to a track so it can never leak into a different song.
+  const resumeAtRef = useRef<{ trackId: number; position: number } | null>(null);
+  // Recovery attempts for the current track, so a persistently failing stream
+  // can't loop between refresh and failure.
+  const streamRecoveryRef = useRef({ trackId: null as number | null, refreshes: 0, mediaRecoveries: 0 });
 
   const [secrets, setSecrets] = useState<Secrets>(() => {
     const savedPb = localStorage.getItem('pb_access_token');
@@ -347,6 +385,8 @@ const App: React.FC = () => {
 
   useEffect(() => {
     void registerServiceWorker();
+    // Fetch the streaming engine in the background so the first tap doesn't wait on it.
+    const warmHls = window.setTimeout(() => { void loadHls().catch(() => {}); }, 1500);
     // Chrome fires this instead of showing its own install UI; stash it so the
     // Install button can replay it later from a user gesture.
     const onBeforeInstall = (e: Event) => {
@@ -360,6 +400,7 @@ const App: React.FC = () => {
     window.addEventListener('beforeinstallprompt', onBeforeInstall);
     window.addEventListener('appinstalled', onInstalled);
     return () => {
+      window.clearTimeout(warmHls);
       window.removeEventListener('beforeinstallprompt', onBeforeInstall);
       window.removeEventListener('appinstalled', onInstalled);
     };
@@ -448,23 +489,97 @@ const App: React.FC = () => {
     };
     audio.addEventListener('timeupdate', onTime);
     audio.addEventListener('loadedmetadata', onDur);
+    // Streams can learn their full length after metadata arrives.
+    audio.addEventListener('durationchange', onDur);
     audio.addEventListener('ended', onEnd);
     return () => {
       audio.removeEventListener('timeupdate', onTime);
       audio.removeEventListener('loadedmetadata', onDur);
+      audio.removeEventListener('durationchange', onDur);
       audio.removeEventListener('ended', onEnd);
     };
   }, [isRepeat, likes, player.track]);
 
-  // Load whenever the source changes, but only start playing if this source came
-  // from an explicit play request. A download loads the track without stealing
-  // playback from whatever the user is already listening to.
+  // The single owner of the <audio> element's source. Blob URLs (a finished download,
+  // or the buffering fallback) are assigned directly. Streams go through hls.js
+  // wherever MediaSource exists, or straight to the element on browsers that play
+  // HLS natively without it (older iPhones). Playback only starts if the source came
+  // from an explicit play request, so a download never hijacks what's playing.
   useEffect(() => {
     const audio = audioRef.current;
-    if (!audio || (!player.streamUrl && !player.blobUrl)) return;
+    if (!audio) return;
+    const { streamUrl, blobUrl, autoPlay, track } = player;
+    if (!streamUrl && !blobUrl) return;
+
+    const resume = resumeAtRef.current;
+    resumeAtRef.current = null;
+    const resumeAt = resume && resume.trackId === track?.id ? resume.position : null;
+
+    let disposed = false;
+    let hls: Hls | null = null;
+    const start = () => {
+      if (disposed || !autoPlay) return;
+      audio.play().then(() => setIsPlaying(true)).catch(() => {});
+    };
+    const seekOnceLoaded = () => {
+      if (!resumeAt) return;
+      // Guarded: if the source changes before metadata arrives, this listener
+      // would otherwise fire on the next song and seek it.
+      audio.addEventListener('loadedmetadata', () => { if (!disposed) audio.currentTime = resumeAt; }, { once: true });
+    };
+
+    if (blobUrl) {
+      audio.src = blobUrl;
+      seekOnceLoaded();
+      audio.load();
+      start();
+      return () => { disposed = true; };
+    }
+
+    // Silence the previous song right away rather than letting it run on while the
+    // stream spins up.
+    audio.removeAttribute('src');
     audio.load();
-    if (!player.autoPlay) return;
-    audio.play().then(() => setIsPlaying(true)).catch(() => {});
+
+    void (async () => {
+      let HlsCtor: typeof Hls | null = null;
+      try { HlsCtor = await loadHls(); } catch { /* no engine: try native HLS below */ }
+      if (disposed || !track) return;
+
+      if (HlsCtor?.isSupported()) {
+        const instance = new HlsCtor({ ...HLS_CONFIG, startPosition: resumeAt ?? -1 });
+        hls = instance;
+        let recovering = false;
+        instance.on(HlsCtor.Events.MANIFEST_PARSED, start);
+        instance.on(HlsCtor.Events.ERROR, (_event, data) => {
+          if (disposed || recovering) return;
+          // An expired signature never heals on retry, so don't wait out hls.js's
+          // backoff (six retries, ~30 s of silence) before refreshing the link.
+          const status = data.response?.code ?? 0;
+          const expired = data.type === HlsCtor!.ErrorTypes.NETWORK_ERROR && [401, 403, 410].includes(status);
+          if (!data.fatal && !expired) return;
+          recovering = true; // one recovery at a time; retries keep erroring meanwhile
+          void recoverStream(instance, HlsCtor!, data, track).finally(() => { recovering = false; });
+        });
+        instance.loadSource(streamUrl!);
+        instance.attachMedia(audio);
+      } else if (audio.canPlayType('application/vnd.apple.mpegurl')) {
+        audio.src = streamUrl!;
+        seekOnceLoaded();
+        audio.addEventListener('error', () => {
+          if (!disposed) void bufferInsteadOfStream(track, audio.currentTime);
+        }, { once: true });
+        audio.load();
+        start();
+      } else {
+        void bufferInsteadOfStream(track, resumeAt ?? 0);
+      }
+    })();
+
+    return () => {
+      disposed = true;
+      hls?.destroy();
+    };
   }, [player.streamUrl, player.blobUrl]);
 
   // Infinite scroll — preload at 70%, and remember where we were.
@@ -730,15 +845,19 @@ const App: React.FC = () => {
     const batchSize = 6;
     const buffers: ArrayBuffer[] = [];
 
-    if (initUrl) {
-      const initRes = await fetch(initUrl);
-      if (initRes.ok) buffers.push(await initRes.arrayBuffer());
-    }
+    // Every piece must arrive intact: stitching an error response into the audio
+    // would produce a corrupt file that still looks like a successful download.
+    const fetchPart = async (url: string) => {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Audio chunk failed (${res.status})`);
+      return res.arrayBuffer();
+    };
+
+    if (initUrl) buffers.push(await fetchPart(initUrl));
 
     for (let i = 0; i < segmentUrls.length; i += batchSize) {
       const batch = segmentUrls.slice(i, i + batchSize);
-      const results = await Promise.all(batch.map(url => fetch(url).then(r => r.arrayBuffer())));
-      buffers.push(...results);
+      buffers.push(...await Promise.all(batch.map(fetchPart)));
     }
 
     const isMp3 = playlistUrl.includes('.mp3') || manifest.includes('audio/mpeg');
@@ -826,6 +945,9 @@ const App: React.FC = () => {
     if (player.blobUrl) window.URL.revokeObjectURL(player.blobUrl);
   };
 
+  // Resolve just enough to start streaming: the track's transcodings (when the feed
+  // copy lacks them) and a signed HLS playlist link. No audio is fetched here — the
+  // player pulls chunks as it plays.
   const prepareStreamPlayback = async (track: Partial<SCTrack> | any, silent = false): Promise<StreamPlaybackPrepared> => {
     const targetUrl = track?.permalink_url;
     if (!targetUrl) throw new Error("Invalid URL");
@@ -836,29 +958,83 @@ const App: React.FC = () => {
       if (!silent) addLog(`"${fullTrackData.title}" - ${fullTrackData.user?.username}`, "success");
     }
 
-    const playlistUrl = await resolveStreamUrl(fullTrackData);
-    if (!silent) addLog("Buffering...", "process");
-    const blob = await fetchHlsAsBlob(playlistUrl);
-    if (!silent) addLog(`${(blob.size / 1024 / 1024).toFixed(1)} MB`, "info");
+    const streamUrl = await resolveStreamUrl(fullTrackData);
     const playerTrack = toPlayerTrack(fullTrackData, targetUrl);
-    return {
-      playerTrack,
-      blobUrl: window.URL.createObjectURL(blob),
-      blob,
-      fileName: toFileName(playerTrack.title),
-    };
+    return { playerTrack, streamUrl, fileName: toFileName(playerTrack.title), preparedAt: Date.now() };
   };
 
   const applyStreamPlayback = (prepared: StreamPlaybackPrepared) => {
     revokePlayerBlobIfAny();
+    // A fresh play gets a fresh recovery budget, even when replaying the same song.
+    Object.assign(streamRecoveryRef.current, { trackId: prepared.playerTrack.id, refreshes: 0, mediaRecoveries: 0 });
     setPlayer({
       track: prepared.playerTrack,
-      streamUrl: null,
-      blobUrl: prepared.blobUrl,
+      streamUrl: prepared.streamUrl,
+      blobUrl: null,
       taggedBlob: null,
       fileName: prepared.fileName,
       autoPlay: true,
     });
+  };
+
+  // Last resort when a stream can't play or be recovered: fetch the whole file up
+  // front — the pre-streaming behaviour — and resume from the same spot.
+  const bufferInsteadOfStream = async (track: SCTrack, position: number) => {
+    addLog('Streaming failed, buffering full track...', 'warning');
+    try {
+      // A bare permalink forces a fresh resolve, so no expired token is reused.
+      const fresh = await prepareStreamPlayback({ permalink_url: track.permalink_url }, true);
+      const blob = await fetchHlsAsBlob(fresh.streamUrl);
+      const blobUrl = window.URL.createObjectURL(blob);
+      if (currentTrackIdRef.current !== track.id) {
+        window.URL.revokeObjectURL(blobUrl); // user moved on while this was buffering
+        return;
+      }
+      resumeAtRef.current = { trackId: track.id, position };
+      setPlayer(prev => prev.track?.id === track.id
+        ? { ...prev, streamUrl: null, blobUrl, autoPlay: true }
+        : prev);
+      addLog('Playing buffered copy', 'success');
+    } catch (error: any) {
+      addLog(`${error.message}`, 'error');
+    }
+  };
+
+  const recoverStream = async (hls: Hls, HlsCtor: typeof Hls, data: ErrorData, track: SCTrack) => {
+    const audio = audioRef.current;
+    const position = audio?.currentTime ?? 0;
+    const attempts = streamRecoveryRef.current;
+    if (attempts.trackId !== track.id) {
+      Object.assign(attempts, { trackId: track.id, refreshes: 0, mediaRecoveries: 0 });
+    }
+
+    // A decode hiccup: hls.js can usually rebuild the media pipeline in place.
+    if (data.type === HlsCtor.ErrorTypes.MEDIA_ERROR && attempts.mediaRecoveries < 1) {
+      attempts.mediaRecoveries++;
+      hls.recoverMediaError();
+      return;
+    }
+
+    // Signed links expired — typically resuming after a long pause. Get fresh ones
+    // and carry on from the same spot.
+    const status = data.response?.code ?? 0;
+    if (data.type === HlsCtor.ErrorTypes.NETWORK_ERROR && [401, 403, 410].includes(status) && attempts.refreshes < 2) {
+      attempts.refreshes++;
+      addLog('Stream link expired, refreshing...', 'network');
+      try {
+        const fresh = await prepareStreamPlayback({ permalink_url: track.permalink_url }, true);
+        if (currentTrackIdRef.current !== track.id) return;
+        resumeAtRef.current = { trackId: track.id, position };
+        setPlayer(prev => prev.track?.id === track.id
+          ? { ...prev, streamUrl: fresh.streamUrl, blobUrl: null, autoPlay: true }
+          : prev);
+        return;
+      } catch {
+        // Couldn't refresh — fall through to buffering the whole file.
+      }
+    }
+
+    await bufferInsteadOfStream(track, position);
   };
 
   const prepareTaggedBlobPlayback = async (track: Partial<SCTrack> | any) => {
@@ -994,8 +1170,9 @@ const App: React.FC = () => {
         return;
       }
 
-      if (prefetchedNextRef.current?.playerTrack.id === nextTrack.id) {
-        applyStreamPlayback(prefetchedNextRef.current);
+      const prefetched = prefetchedNextRef.current;
+      if (prefetched?.playerTrack.id === nextTrack.id && Date.now() - prefetched.preparedAt < STREAM_URL_MAX_AGE_MS) {
+        applyStreamPlayback(prefetched);
         prefetchedNextRef.current = null;
         prefetchTriggeredForTrackIdRef.current = null;
         addLog(`Next track instant`, "success");
@@ -1363,7 +1540,8 @@ const App: React.FC = () => {
   return (
     <div className="min-h-screen relative z-10 flex flex-col" style={{ fontFamily: "'Poppins', sans-serif", paddingBottom: 88 }}>
       {/* Hidden audio element */}
-      <audio ref={audioRef} src={player.streamUrl || player.blobUrl || undefined} />
+      {/* No src prop: the source effect owns it, since hls.js attaches its own. */}
+      <audio ref={audioRef} />
 
       {/* ========== HEADER ========== */}
       <header className="px-5 pt-5 pb-3 lg:px-10 lg:pt-7 fade-up">
